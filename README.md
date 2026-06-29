@@ -16,6 +16,7 @@ The helper script can:
 - discover a SailfishOS build root one level below a repo root
 - clean stale in-place build artifacts when switching architectures
 - perform a Docker shadow build with `mb2`
+- document how to use an installed `/srv/mer` devel SDK target, including the privileged Docker wrapper used when direct host `sudo` is unavailable
 - archive RPMs under `RPMS/<release>/<arch>/<release|debug>/`
 - generate debug packages when `--debug` is used
 - save build logs and machine-readable build metadata under `.mb2/`

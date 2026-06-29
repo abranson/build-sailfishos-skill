@@ -31,7 +31,6 @@ ROOT_PATTERNS = (
     "*.a",
     "*.so",
     "*.prl",
-    "*.list",
     "moc_*.cpp",
     "moc_*.o",
     "qrc_*.cpp",
@@ -56,7 +55,6 @@ RECURSIVE_PATTERNS = (
     "**/*.a",
     "**/*.so",
     "**/*.prl",
-    "**/*.list",
     "**/ui_*.h",
     "**/CMakeCache.txt",
     "**/cmake_install.cmake",
@@ -251,7 +249,10 @@ def parse_last_arch(project_dir: Path) -> str | None:
         return None
 
     if target.startswith("SailfishOS-"):
-        return target.rsplit("-", 1)[-1]
+        arch = target.rsplit("-", 1)[-1]
+        if arch.endswith(".default"):
+            arch = arch[: -len(".default")]
+        return arch
 
     prefix = target.split(".", 1)[0].strip()
     return prefix or None
@@ -347,6 +348,7 @@ def pro_targets(project_dir: Path) -> set[str]:
 
 
 def generated_candidate_paths(project_dir: Path) -> set[Path]:
+    tracked_paths = tracked_git_paths(project_dir)
     paths: set[Path] = set()
 
     for dirname in ROOT_DIRS:
@@ -377,7 +379,44 @@ def generated_candidate_paths(project_dir: Path) -> set[Path]:
     if state_dir.exists():
         paths.discard(state_dir)
 
-    return {path for path in paths if path.exists()}
+    return {
+        path
+        for path in paths
+        if path.exists() and path.resolve() not in tracked_paths
+    }
+
+
+def tracked_git_paths(project_dir: Path) -> set[Path]:
+    try:
+        repo_roots = git_worktree_roots(project_dir)
+    except OSError:
+        return set()
+
+    tracked: set[Path] = set()
+    for root in repo_roots:
+        try:
+            result = run(
+                ["git", "-C", str(root), "ls-files", "-z"],
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+
+        for rel_path in result.stdout.split("\0"):
+            if not rel_path:
+                continue
+            tracked.add((root / rel_path).resolve())
+    return tracked
+
+
+def git_worktree_roots(project_dir: Path) -> list[Path]:
+    roots = {project_dir.resolve()}
+    for git_marker in project_dir.rglob(".git"):
+        if ".mb2" in git_marker.parts:
+            continue
+        repo_root = git_marker.parent.resolve()
+        roots.add(repo_root)
+    return sorted(roots)
 
 
 def load_manifest(project_dir: Path) -> list[Path]:
@@ -490,6 +529,13 @@ def ensure_container_write_access(project_dir: Path, permission_fallback: str) -
             [
                 "find",
                 str(project_dir),
+                "(",
+                "-type",
+                "f",
+                "-o",
+                "-type",
+                "d",
+                ")",
                 "-uid",
                 str(current_uid),
                 "-exec",
@@ -619,11 +665,20 @@ def variant_destination_dir(base_dir: Path, release: str, arch: str, debug_build
     return base_dir / release / arch / ("debug" if debug_build else "release")
 
 
-def build_arch(project_dir: Path, release: str, arch: str, debug_build: bool = False) -> None:
+def build_arch(
+    project_dir: Path,
+    release: str,
+    arch: str,
+    debug_build: bool = False,
+    local_rpm_dirs: list[Path] | None = None,
+) -> None:
     image = f"{CONTAINER_IMAGE}:{release}"
     target = f"SailfishOS-{release}-{arch}"
     binary_names = ":".join(sorted(spec_names(project_dir) | pro_targets(project_dir)))
-    command = r'''
+    is_gecko_build = (project_dir / "gecko-dev").is_dir() and (project_dir / "rpm" / "xulrunner-qt5.spec").is_file()
+    local_rpm_dirs = local_rpm_dirs or []
+    local_rpm_mounts = [f"/local-rpms/{index}" for index, _ in enumerate(local_rpm_dirs)]
+    build_command = r'''
 set -euo pipefail
 workroot="${HOME:-/tmp}"
 if [ ! -d "$workroot" ] || [ ! -w "$workroot" ]; then
@@ -647,7 +702,46 @@ mkdir -p "$workdir"
 cp -a /share/. "$workdir/"
 rm -rf "$workdir/RPMS"
 cd "$workdir"
-mb2_args=( -t "$TARGET" build )
+if [ "${IS_GECKO_BUILD:-0}" = "1" ]; then
+  # The local Sailfish gecko checkout already has the rpm/ patch stack applied,
+  # so keep %prep for its bootstrap side effects but disable patch re-apply in
+  # the copied spec.
+  sed -i \
+    -e 's/^%autosetup -p1 -n /%autosetup -N -n /' \
+    rpm/xulrunner-qt5.spec
+fi
+
+if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
+  rpm_files=()
+  OLDIFS="$IFS"
+  IFS=':'
+  for dir in ${LOCAL_RPM_DIRS}; do
+    [ -d "$dir" ] || continue
+    for rpm in "$dir"/*.rpm; do
+      [ -e "$rpm" ] || continue
+      case "$(basename "$rpm")" in
+        *-debuginfo-*|*-debugsource-*|*-tests-*|*-examples-*|*-doc-*|*-ts-devel-*)
+          continue
+          ;;
+      esac
+      rpm_files+=("$rpm")
+    done
+  done
+  IFS="$OLDIFS"
+  if [ "${#rpm_files[@]}" -gt 0 ]; then
+    zypper --non-interactive install --allow-unsigned-rpm --oldpackage --force-resolution \
+      "${rpm_files[@]}" 2>&1 | tee -a "$logfile"
+  fi
+fi
+
+mb2_args=( -t "$TARGET" )
+if [ "${IS_GECKO_BUILD:-0}" = "1" ]; then
+  mb2_args+=( --no-vcs-apply )
+fi
+mb2_args+=( build )
+if [ "${IS_GECKO_BUILD:-0}" = "1" ]; then
+  mb2_args+=( --prepare )
+fi
 if [ "${DEBUG_BUILD:-0}" = "1" ]; then
   mb2_args+=( -d )
 fi
@@ -695,16 +789,42 @@ for name in ${SYNC_BINARIES:-}; do
 done
 IFS="$OLDIFS"
 '''
+    gecko_wrapper_command = rf'''
+set -euo pipefail
+if [ ! -e /usr/lib/libclang.so.15 ]; then
+  zypper --non-interactive install clang-libs
+fi
+if ! rpm -q gcc-c++ >/dev/null 2>&1; then
+  zypper --non-interactive install gcc-c++
+fi
+python3 - <<'PY'
+import os
+import pwd
+
+pw = pwd.getpwnam("mersdk")
+os.environ["HOME"] = pw.pw_dir
+os.setgroups([])
+os.setgid(pw.pw_gid)
+os.setuid(pw.pw_uid)
+os.execvp("bash", ["bash", "-lc", {build_command!r}])
+PY
+'''
     log(f"Building {target} via container shadow build and syncing artifacts back in place")
     try:
-        run(
+        docker_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--privileged",
+            "-v",
+            f"{project_dir}:/share",
+        ]
+        if is_gecko_build:
+            docker_cmd.extend(["-u", "0"])
+        for mount_path, local_rpm_dir in zip(local_rpm_mounts, local_rpm_dirs):
+            docker_cmd.extend(["-v", f"{local_rpm_dir}:{mount_path}:ro"])
+        docker_cmd.extend(
             [
-                "docker",
-                "run",
-                "--rm",
-                "--privileged",
-                "-v",
-                f"{project_dir}:/share",
                 "-e",
                 f"TARGET={target}",
                 "-e",
@@ -717,12 +837,17 @@ IFS="$OLDIFS"
                 f"BUILD_LOG={build_log_path(project_dir)}",
                 "-e",
                 f"SYNC_BINARIES={binary_names}",
+                "-e",
+                f"LOCAL_RPM_DIRS={':'.join(local_rpm_mounts)}",
+                "-e",
+                f"IS_GECKO_BUILD={'1' if is_gecko_build else '0'}",
                 image,
                 "bash",
                 "-lc",
-                command,
+                gecko_wrapper_command if is_gecko_build else build_command,
             ]
         )
+        run(docker_cmd)
     except subprocess.CalledProcessError:
         diagnose_missing_dependencies(project_dir, release, arch)
         raise
@@ -799,6 +924,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass -d to mb2 build so main binaries are stripped and debug packages are generated",
     )
+    parser.add_argument(
+        "--local-rpms-dir",
+        action="append",
+        default=[],
+        help="Directory of locally built RPMs to install into the SDK target before building; may be repeated",
+    )
     parser.add_argument("--no-pull", action="store_true", help="Skip docker pull before building")
     return parser.parse_args()
 
@@ -822,6 +953,7 @@ def main() -> int:
 
     arches = resolve_arches(args.arch, args.all, supported_arches, project_dir)
     artifacts_dir = Path(args.artifacts_dir).resolve() if args.artifacts_dir else default_artifacts_dir(project_dir)
+    local_rpm_dirs = [Path(path).resolve() for path in args.local_rpms_dir]
 
     ensure_container_write_access(project_dir, args.permission_fallback)
 
@@ -834,7 +966,13 @@ def main() -> int:
             cleanup_generated_artifacts(project_dir, "Explicit cleanup requested")
 
         try:
-            build_arch(project_dir, release, arch, debug_build=args.debug)
+            build_arch(
+                project_dir,
+                release,
+                arch,
+                debug_build=args.debug,
+                local_rpm_dirs=local_rpm_dirs,
+            )
             write_target_marker(project_dir, arch)
 
             manifest_paths = generated_candidate_paths(project_dir)

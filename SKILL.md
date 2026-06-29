@@ -1,6 +1,6 @@
 ---
 name: build-sailfishos
-description: Use when asked to build a SailfishOS project, validate that a SailfishOS project can package successfully, or produce RPMs for a specific SailfishOS release and architecture from Docker. This skill pulls `coderus/sailfishos-platform-sdk:<release>`, checks `.mb2/target` for the last in-place build architecture, removes stale in-place build artifacts before switching architectures, and performs a Docker shadow build whose resulting build state and generated artifacts are synced back into the real project tree, with RPMs archived under `RPMS/` by default.
+description: Use when asked to build a SailfishOS project, validate packaging, produce RPMs for a specific SailfishOS release and architecture from Docker, or use an installed `/srv/mer` devel SDK target. For normal releases this skill pulls `coderus/sailfishos-platform-sdk:<release>`; for devel it uses a privileged Docker wrapper around the local SDK chroot instead of launching `sdk-chroot` directly from Codex. It checks `.mb2/target`, removes stale in-place artifacts before switching architectures, and archives RPMs under `RPMS/` by default.
 ---
 
 # Build SailfishOS
@@ -19,6 +19,52 @@ In the example commands below, replace `<skill-dir>` with the actual path to thi
 3. Run `scripts/build_sailfishos.py` from the SailfishOS build root or pass `--project-dir`. If the passed directory does not contain `rpm/*.spec`, the helper checks one level deep for a unique SailfishOS build root such as `sailfish/`.
 4. Report the built RPM paths from `RPMS/<release>/<arch>/<release|debug>/`.
    If the user explicitly passed `--artifacts-dir`, also report the copied RPM paths there.
+
+## Local Devel SDK
+
+Use the installed SDK under `/srv/mer` when the user asks for `devel`, when they name an installed target such as `aarch64`, or when the newest public Docker SDK tag is too old for the package being tested.
+Pass the target architecture to `mb2` without a snapshot suffix, for example `-t aarch64`; `mb2` automatically selects the appropriate snapshot.
+
+The Docker Hub flow above is release-image based. It is not a substitute for an installed devel target: a public image such as `coderus/sailfishos-platform-sdk:5.0.0.43` can have an older userspace than the local devel target, and direct `mb2` use inside an old image can fail before the build starts, for example because the devel target compiler requires newer `glibc` symbols.
+
+For Codex, use the privileged Docker wrapper first. Do not try to launch
+`/srv/mer/sdks/sfossdk/sdk-chroot` directly from the host: it needs sudo-level
+privileges and fails in normal sandboxed Codex runs.
+
+Docker is used only as a privileged wrapper around the installed SDK. Mount `/srv/mer` and the project home, then enter `/srv/mer/sdks/sfossdk/sdk-chroot` from inside the container. Use a local SDK build-engine image if one exists, such as `sailfish-sdk-build-engine:<user>`.
+
+```bash
+docker run --rm --privileged \
+  -v /srv/mer:/srv/mer \
+  -v /home/$USER:/home/$USER \
+  -w /path/to/project \
+  sailfish-sdk-build-engine:$USER \
+  bash -lc '
+    set -euo pipefail
+    sed -i "s#^mersdk:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:#'"$USER"':x:$(id -u):$(id -g)::/home/'"$USER"':#" /etc/passwd
+    /srv/mer/sdks/sfossdk/sdk-chroot -u '"$USER"' bash -lc '"'"'
+      set -o pipefail
+      cd /path/to/project
+      mkdir -p .mb2
+      mb2 -t aarch64 --no-vcs-apply build --prepare -d 2>&1 | tee .mb2/build-sailfishos-devel-last.log
+      exit ${PIPESTATUS[0]}
+    '"'"'
+  '
+```
+
+The `/etc/passwd` rewrite is ephemeral inside the wrapper container. It is needed when the image only has a `mersdk` user but the SDK chroot should run as the real project owner so build artifacts remain writable in the host checkout.
+Use `--no-vcs-apply` for already-patched or dirty local source trees where `mb2` must not try to apply VCS state itself.
+
+For RPM packaging trees where the source checkout is already patched, temporarily disable `%autosetup` patch application for local iteration and restore the spec afterward:
+
+```bash
+spec=rpm/package.spec
+backup=$(mktemp)
+cp -a "$spec" "$backup"
+trap 'cp -a "$backup" "$spec"; rm -f "$backup"' EXIT
+sed -i -e 's/^%autosetup -p1 -n /%autosetup -N -n /' "$spec"
+# run the local devel mb2 command here
+```
 
 ## Behavior
 
@@ -91,6 +137,9 @@ python3 <skill-dir>/scripts/build_sailfishos.py --project-dir . --release 5.0.0 
 ## Notes
 
 - If the user asks to “build this SailfishOS project”, prefer the recorded `.mb2/target` architecture when present.
+- If the user asks to use `devel`, prefer the installed `/srv/mer` SDK through
+  the privileged Docker wrapper over resolving a public Docker SDK release or
+  launching `sdk-chroot` directly from Codex.
 - In multi-target repositories, it is fine to point `--project-dir` at the repo root when there is exactly one one-level-deep SailfishOS packaging directory.
 - If the project tree is not writable by the Docker container user and `setfacl` is unavailable, stop and explain the permission issue instead of guessing.
 - Keep cleanup limited to generated in-place build artifacts. Do not delete source files or unrelated untracked files.
