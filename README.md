@@ -12,7 +12,8 @@ The skill includes:
 
 The helper script can:
 
-- resolve a SailfishOS SDK release, including shorthand versions and the latest available release
+- resolve an explicit release or shorthand to a matching tag in the third-party
+  `coderus/sailfishos-platform-sdk` mirror, with optional newest-tag selection
 - discover a SailfishOS build root one level below a repo root
 - clean stale in-place build artifacts when switching architectures
 - perform a Docker shadow build with `mb2`

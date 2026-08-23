@@ -1,7 +1,7 @@
 interface:
   display_name: "Build SailfishOS"
-  short_description: "Build SailfishOS RPMs with Docker MB2."
-  default_prompt: "Use $build-sailfishos to build this SailfishOS project for a chosen release and architecture."
+  short_description: "Build SailfishOS RPMs with Docker or local SDK."
+  default_prompt: "Use $build-sailfishos to preflight and build this SailfishOS project for the right release and target."
 
 policy:
   allow_implicit_invocation: true

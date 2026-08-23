@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager, nullcontext
+import fcntl
 import json
 import os
 import re
@@ -8,6 +10,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -17,12 +21,29 @@ from urllib.request import urlopen
 
 
 CONTAINER_UID = 100000
+# Third-party mirror. Its tags describe available build images, not the current
+# official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
+HELPER_VERSION = "2.0.0"
+LIVE_RELEASE = "live"
+DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
+LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
 STATE_DIRNAME = "build-sailfishos-skill"
 MANIFEST_NAME = "build-sailfishos-skill-manifest.txt"
 BUILD_LOG_NAME = "build-sailfishos-skill-last.log"
 BUILD_METADATA_NAME = "build-sailfishos-skill-last-build.json"
+BUILD_LOCK_NAME = "build-sailfishos-skill.lock"
+LOCAL_RPMS_STAGING_NAME = "local-rpms"
 DEFAULT_PERMISSION_FALLBACK = "error"
+
+LOCAL_RPM_EXCLUDED_MARKERS = (
+    "-debuginfo-",
+    "-debugsource-",
+    "-tests-",
+    "-examples-",
+    "-doc-",
+    "-ts-devel-",
+)
 
 ROOT_PATTERNS = (
     "Makefile",
@@ -69,6 +90,32 @@ ROOT_DIRS = (
     "installroot",
 )
 
+LOCAL_TARGET_ARCHES = ("aarch64", "armv7hl", "i486")
+
+
+@dataclass(frozen=True)
+class LocalSdkTarget:
+    arch: str
+    target: str
+    release: str
+    version_id: str
+    flavour: str
+
+
+@dataclass(frozen=True)
+class LocalSdkBuild:
+    arch: str
+    target: str
+
+
+@dataclass(frozen=True)
+class BuildContext:
+    backend: str
+    release: str
+    image: str | None
+    image_id: str | None
+    local_sdk: str | None
+
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
@@ -106,12 +153,55 @@ def build_metadata_path(project_dir: Path) -> Path:
     return project_dir / ".mb2" / BUILD_METADATA_NAME
 
 
+def build_lock_path(project_dir: Path) -> Path:
+    return project_dir / ".mb2" / BUILD_LOCK_NAME
+
+
 def default_artifacts_dir(project_dir: Path) -> Path:
     return project_dir / "RPMS"
 
 
 def staging_rpms_dir(project_dir: Path) -> Path:
     return project_state_dir(project_dir) / "rpms"
+
+
+def local_rpms_staging_dir(project_dir: Path) -> Path:
+    return project_state_dir(project_dir) / LOCAL_RPMS_STAGING_NAME
+
+
+def write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def project_build_lock(project_dir: Path):
+    path = build_lock_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            owner = lock_file.read().strip()
+            detail = f" (owner {owner})" if owner else ""
+            raise SystemExit(f"Another SailfishOS build is already active for {project_dir}{detail}.") from exc
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()} started_utc={datetime.now(timezone.utc).isoformat()}\n")
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def has_spec_files(project_dir: Path) -> bool:
@@ -127,7 +217,7 @@ def is_version_release_tag(value: str) -> bool:
     return bool(re.fullmatch(r"\d+(?:\.\d+){3}", value))
 
 
-def fetch_release_tags(prefix: str | None = None) -> list[str]:
+def fetch_coderus_mirror_tags(prefix: str | None = None) -> list[str]:
     name_filter = quote(prefix) if prefix else ""
 
     matches: list[str] = []
@@ -150,22 +240,25 @@ def fetch_release_tags(prefix: str | None = None) -> list[str]:
     return sorted(dict.fromkeys(matches), key=parse_version)
 
 
-def latest_release_tag() -> str:
-    matches = fetch_release_tags()
+def latest_coderus_mirror_tag() -> str:
+    matches = fetch_coderus_mirror_tags()
     if not matches:
         raise SystemExit(
-            f"Could not determine the latest SailfishOS release from {CONTAINER_IMAGE} tags."
+            f"Could not determine the newest available Docker image tag from {CONTAINER_IMAGE}."
         )
     return matches[-1]
 
 
 def normalize_release_tag(release: str) -> str:
+    if release.lower() == LIVE_RELEASE:
+        return LIVE_RELEASE
+
     if release == "latest":
         try:
-            resolved = latest_release_tag()
+            resolved = latest_coderus_mirror_tag()
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-            raise SystemExit("Could not resolve SailfishOS release tag 'latest'") from exc
-        log(f"Resolved SailfishOS release latest to {resolved}")
+            raise SystemExit(f"Could not resolve Docker image tag 'latest' from {CONTAINER_IMAGE}") from exc
+        log(f"Resolved newest available {CONTAINER_IMAGE} image tag to {resolved}")
         return resolved
 
     if not re.fullmatch(r"\d+(?:\.\d+){2,3}", release):
@@ -174,7 +267,7 @@ def normalize_release_tag(release: str) -> str:
         return release
 
     try:
-        matches = fetch_release_tags(release)
+        matches = fetch_coderus_mirror_tags(release)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         return release
 
@@ -184,7 +277,7 @@ def normalize_release_tag(release: str) -> str:
         return release
 
     resolved = max(matches, key=parse_version)
-    log(f"Resolved SailfishOS release {release} to {resolved}")
+    log(f"Resolved release shorthand {release} to {CONTAINER_IMAGE} image tag {resolved}")
     return resolved
 
 
@@ -229,13 +322,17 @@ def resolve_release(project_dirs: Iterable[Path], explicit_release: str | None) 
             return normalize_release_tag(inferred)
 
     try:
-        resolved = latest_release_tag()
+        resolved = latest_coderus_mirror_tag()
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(
-            "Could not determine SailfishOS release from arguments, environment, workflows, or Docker tags."
+            "Could not determine a build release from arguments, environment, workflows, "
+            f"or available {CONTAINER_IMAGE} image tags."
         ) from exc
 
-    log(f"No SailfishOS release specified; using latest available release {resolved}")
+    log(
+        f"No build release specified; using newest available {CONTAINER_IMAGE} "
+        f"image tag {resolved}. This does not identify the current SailfishOS release."
+    )
     return resolved
 
 
@@ -262,6 +359,42 @@ def pull_image(release: str) -> None:
     image = f"{CONTAINER_IMAGE}:{release}"
     log(f"Pulling {image}")
     run(["docker", "pull", image])
+
+
+def docker_image_exists(image: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        check=False,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def docker_image_id(image: str) -> str | None:
+    try:
+        result = run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return result.stdout.strip() or None
+
+
+def ensure_image(release: str, pull_policy: str) -> tuple[str, bool]:
+    image = f"{CONTAINER_IMAGE}:{release}"
+    exists = docker_image_exists(image)
+    should_pull = pull_policy == "always" or (pull_policy == "missing" and not exists)
+    if should_pull:
+        pull_image(release)
+        return image, True
+    if not exists:
+        raise SystemExit(
+            f"Docker image {image} is not available locally and pull policy is '{pull_policy}'."
+        )
+    return image, False
 
 
 def list_supported_arches(release: str) -> list[str]:
@@ -314,6 +447,23 @@ def resolve_arches(requested_arches: list[str], build_all: bool, supported_arche
     raise SystemExit(
         "No architecture was specified and .mb2/target did not contain a supported one. "
         f"Pass --arch or --all. Supported: {', '.join(supported_arches)}"
+    )
+
+
+def resolve_local_sdk_arches(requested_arches: list[str], build_all: bool, project_dir: Path) -> list[str]:
+    if build_all:
+        raise SystemExit("Local SDK builds use installed SDK targets; pass one or more explicit --arch values.")
+
+    if requested_arches:
+        return requested_arches
+
+    last_arch = parse_last_arch(project_dir)
+    if last_arch:
+        return [last_arch]
+
+    raise SystemExit(
+        "No architecture was specified and .mb2/target did not contain a previous target. "
+        "Pass --arch for local SDK builds."
     )
 
 
@@ -457,26 +607,46 @@ def write_manifest(project_dir: Path, paths: Iterable[Path]) -> None:
 def write_build_metadata(
     project_dir: Path,
     *,
-    release: str,
-    arch: str,
+    context: BuildContext,
+    builds: list[dict[str, object]],
     debug_build: bool,
     artifacts_dir: Path,
     status: str,
-    rpms: Iterable[Path],
+    started_at: datetime,
+    failure_class: str | None = None,
+    failure_message: str | None = None,
 ) -> None:
     metadata_file = build_metadata_path(project_dir)
-    metadata_file.parent.mkdir(parents=True, exist_ok=True)
+    finished_at = datetime.now(timezone.utc)
+    serialized_builds: list[dict[str, object]] = []
+    for build in builds:
+        serialized = dict(build)
+        serialized["rpms"] = [str(path) for path in build.get("rpms", [])]
+        serialized_builds.append(serialized)
+    rpms = [path for build in serialized_builds for path in build.get("rpms", [])]
     payload = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "release": release,
-        "arch": arch,
+        "schema_version": 2,
+        "helper_version": HELPER_VERSION,
+        "started_utc": started_at.isoformat(),
+        "updated_utc": finished_at.isoformat(),
+        "finished_utc": None if status == "running" else finished_at.isoformat(),
+        "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+        "backend": context.backend,
+        "release": context.release,
+        "image": context.image,
+        "image_id": context.image_id,
+        "local_sdk": context.local_sdk,
         "debug": debug_build,
         "status": status,
+        "failure_class": failure_class,
+        "failure_message": failure_message,
         "artifacts_dir": str(artifacts_dir),
         "build_log": str(build_log_path(project_dir)),
-        "rpms": [str(path) for path in rpms],
+        "builds": serialized_builds,
+        "rpms": rpms,
+        "rpmlint": rpmlint_summary(build_log_path(project_dir)),
     }
-    metadata_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_atomic(metadata_file, payload)
 
 
 def write_target_marker(project_dir: Path, arch: str) -> None:
@@ -523,45 +693,52 @@ def ensure_container_write_access(project_dir: Path, permission_fallback: str) -
     current_uid = os.getuid()
     if shutil.which("setfacl"):
         log(
-            f"Granting write ACLs to host uid {current_uid} and container uid {CONTAINER_UID} under {project_dir}"
+            f"Granting read ACLs under {project_dir} and scoped output write ACLs to container uid {CONTAINER_UID}"
+        )
+        (project_dir / ".mb2").mkdir(parents=True, exist_ok=True)
+        run(
+            [
+                "find",
+                str(project_dir),
+                "-type",
+                "d",
+                "-uid",
+                str(current_uid),
+                "-exec",
+                "setfacl",
+                "-m",
+                f"u:{CONTAINER_UID}:rX",
+                "{}",
+                "+",
+            ]
         )
         run(
             [
                 "find",
                 str(project_dir),
-                "(",
                 "-type",
                 "f",
-                "-o",
-                "-type",
-                "d",
-                ")",
                 "-uid",
                 str(current_uid),
                 "-exec",
                 "setfacl",
                 "-m",
-                f"u:{current_uid}:rwX,u:{CONTAINER_UID}:rwX",
+                f"u:{CONTAINER_UID}:rX",
                 "{}",
                 "+",
             ]
         )
-        run(
-            [
-                "find",
-                str(project_dir),
-                "-type",
-                "d",
-                "-uid",
-                str(current_uid),
-                "-exec",
-                "setfacl",
-                "-m",
-                f"d:u:{current_uid}:rwX,d:u:{CONTAINER_UID}:rwX",
-                "{}",
-                "+",
-            ]
-        )
+        writable_paths = {project_dir, project_dir / ".mb2"}
+        translations = project_dir / "translations"
+        if translations.is_dir():
+            writable_paths.add(translations)
+        writable_paths.update(generated_candidate_paths(project_dir))
+        for path in sorted(writable_paths):
+            if not path.exists():
+                continue
+            run(["setfacl", "-m", f"u:{CONTAINER_UID}:rwX", str(path)])
+            if path.is_dir():
+                run(["setfacl", "-m", f"d:u:{CONTAINER_UID}:rwX", str(path)])
         return
 
     if permission_fallback == "chmod":
@@ -573,6 +750,85 @@ def ensure_container_write_access(project_dir: Path, permission_fallback: str) -
         "setfacl is unavailable, so the Docker container may not be able to write in place. "
         "Install acl utilities or rerun with --permission-fallback chmod."
     )
+
+
+def usable_local_rpms(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        raise SystemExit(f"Local RPM directory not found: {directory}")
+    return [
+        rpm
+        for rpm in sorted(directory.glob("*.rpm"))
+        if not any(marker in rpm.name for marker in LOCAL_RPM_EXCLUDED_MARKERS)
+    ]
+
+
+def validate_local_rpm_dirs(directories: list[Path]) -> dict[Path, list[Path]]:
+    selected: dict[Path, list[Path]] = {}
+    for directory in directories:
+        rpms = usable_local_rpms(directory)
+        if not rpms:
+            raise SystemExit(f"No installable RPMs found in local RPM directory: {directory}")
+        selected[directory] = rpms
+    return selected
+
+
+@contextmanager
+def stage_local_sdk_rpms(project_dir: Path, selected: dict[Path, list[Path]]):
+    staging_root = local_rpms_staging_dir(project_dir)
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    staged_dirs: list[Path] = []
+    try:
+        for index, rpms in enumerate(selected.values()):
+            destination = staging_root / str(index)
+            destination.mkdir(parents=True, exist_ok=True)
+            for rpm in rpms:
+                shutil.copy2(rpm, destination / rpm.name)
+            staged_dirs.append(destination)
+        yield staged_dirs
+    finally:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+
+
+def rpmlint_summary(log_file: Path) -> dict[str, int]:
+    summary = {"errors": 0, "warnings": 0}
+    if not log_file.is_file():
+        return summary
+    try:
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return summary
+    final = re.findall(r"(?im);\s*(\d+)\s+errors?,\s*(\d+)\s+warnings?\.?$", text)
+    if final:
+        summary["errors"], summary["warnings"] = map(int, final[-1])
+        return summary
+    summary["errors"] = len(re.findall(r"(?m)^\S.*:\s+E:\s+", text))
+    summary["warnings"] = len(re.findall(r"(?m)^\S.*:\s+W:\s+", text))
+    return summary
+
+
+def classify_failure(error: BaseException, log_file: Path | None = None) -> str:
+    text = str(error)
+    if log_file and log_file.is_file():
+        try:
+            text += "\n" + log_file.read_text(encoding="utf-8", errors="replace")[-20000:]
+        except OSError:
+            pass
+    lowered = text.lower()
+    if "failed build dependencies" in lowered or "is needed by" in lowered:
+        return "missing-build-requires"
+    if "no basic authentication credentials" in lowered or "repository" in lowered and "not found" in lowered:
+        return "repository"
+    if "signature" in lowered or "gpg" in lowered or "unsigned rpm" in lowered:
+        return "package-trust"
+    if "permission denied" in lowered or "operation not permitted" in lowered:
+        return "permission"
+    if "docker image" in lowered or "manifest unknown" in lowered or "pull access denied" in lowered:
+        return "image"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "timeout"
+    return "build"
 
 
 def parse_missing_build_requires(log_text: str) -> list[str]:
@@ -665,12 +921,397 @@ def variant_destination_dir(base_dir: Path, release: str, arch: str, debug_build
     return base_dir / release / arch / ("debug" if debug_build else "release")
 
 
+def host_user() -> str:
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or Path.home().name
+
+
+def local_sdk_build_engine_image(user: str) -> str:
+    return os.environ.get(LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV, f"sailfish-sdk-build-engine:{user}")
+
+
+def local_sdk_project_mount_root(project_dir: Path) -> Path:
+    home = Path.home().resolve()
+    resolved = project_dir.resolve()
+    try:
+        resolved.relative_to(home)
+    except ValueError as exc:
+        raise SystemExit(
+            "Local SDK builds currently require the project to live under the current user's home "
+            "directory so the installed SDK chroot can see the same path."
+        ) from exc
+    return home
+
+
+def local_sdk_mount_root(local_sdk: Path) -> Path:
+    resolved = local_sdk.resolve(strict=False)
+    srv_mer = Path("/srv/mer")
+    try:
+        resolved.relative_to(srv_mer)
+    except ValueError:
+        return resolved.parent
+    return srv_mer
+
+
+def local_sdk_targets_dir(local_sdk: Path) -> Path:
+    return local_sdk_mount_root(local_sdk) / "targets"
+
+
+def canonical_local_target_name(name: str) -> str:
+    while name.endswith(".default"):
+        name = name[: -len(".default")]
+    return name
+
+
+def split_local_target_arch(target: str) -> tuple[str, str] | None:
+    for arch in LOCAL_TARGET_ARCHES:
+        if target == arch:
+            return arch, ""
+        if target.startswith(f"{arch}-"):
+            return arch, target[len(arch) + 1 :]
+    return None
+
+
+def read_key_value_file(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+
+    metadata: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("[") or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        metadata[key.strip()] = value.strip().strip('"')
+    return metadata
+
+
+def target_metadata(target_dir: Path) -> dict[str, str]:
+    sailfish = read_key_value_file(target_dir / "etc" / "sailfish-release")
+    ssu = read_key_value_file(target_dir / "etc" / "ssu" / "ssu.ini")
+    return {
+        "release": ssu.get("release", ""),
+        "version_id": sailfish.get("VERSION_ID", ""),
+        "flavour": ssu.get("flavour") or sailfish.get("SAILFISH_FLAVOUR", ""),
+    }
+
+
+def list_local_sdk_targets(local_sdk: Path) -> list[LocalSdkTarget]:
+    targets_dir = local_sdk_targets_dir(local_sdk)
+    if not targets_dir.is_dir():
+        return []
+
+    targets: dict[str, LocalSdkTarget] = {}
+    for child in sorted(targets_dir.iterdir()):
+        if not child.is_dir() or ".pool." in child.name:
+            continue
+
+        target = canonical_local_target_name(child.name)
+        arch_and_suffix = split_local_target_arch(target)
+        if arch_and_suffix is None:
+            continue
+        arch, suffix = arch_and_suffix
+
+        if target in targets and child.name != target:
+            continue
+
+        metadata = target_metadata(child)
+        release = metadata.get("release", "")
+        version_id = metadata.get("version_id", "")
+        flavour = metadata.get("flavour", "")
+        if not release and suffix:
+            release = suffix
+        targets[target] = LocalSdkTarget(
+            arch=arch,
+            target=target,
+            release=release,
+            version_id=version_id,
+            flavour=flavour,
+        )
+    return sorted(targets.values(), key=lambda item: (item.arch, item.target))
+
+
+def release_component_count(release: str) -> int:
+    return len(release.split(".")) if re.fullmatch(r"\d+(?:\.\d+){2,3}", release) else 0
+
+
+def local_target_matches_release(target: LocalSdkTarget, release: str) -> bool:
+    release = normalize_local_release(release)
+    if not release or release == LIVE_RELEASE:
+        return target.release == LIVE_RELEASE
+    if release == "latest":
+        return False
+
+    if target.release == release or target.version_id == release:
+        return True
+
+    component_count = release_component_count(release)
+    if component_count == 3:
+        return target.version_id.startswith(f"{release}.") or target.target.endswith(f"-{release}")
+
+    return target.target.endswith(f"-{release}")
+
+
+def normalize_local_release(release: str | None) -> str:
+    if not release:
+        return ""
+    release = release.strip()
+    if release.lower() == LIVE_RELEASE:
+        return LIVE_RELEASE
+    return release
+
+
+def requested_release(project_dirs: Iterable[Path], explicit_release: str | None) -> str | None:
+    requested = explicit_requested_release(explicit_release)
+    if requested:
+        return requested
+
+    seen: set[Path] = set()
+    for project_dir in project_dirs:
+        if project_dir in seen:
+            continue
+        seen.add(project_dir)
+        inferred = infer_release_from_workflows(project_dir)
+        if inferred:
+            return inferred
+
+    return None
+
+
+def explicit_requested_release(explicit_release: str | None) -> str | None:
+    if explicit_release:
+        return explicit_release
+
+    env_release = os.environ.get("SAILFISHOS_RELEASE")
+    if env_release:
+        return env_release
+
+    return None
+
+
+def local_sdk_requested_release(explicit_release: str | None) -> str:
+    return normalize_local_release(explicit_requested_release(explicit_release)) or LIVE_RELEASE
+
+
+def select_local_sdk_builds(
+    local_sdk: Path,
+    release: str,
+    requested_arches: list[str],
+    build_all: bool,
+    project_dir: Path,
+    requested_targets: list[str] | None = None,
+) -> list[LocalSdkBuild] | None:
+    requested_targets = requested_targets or []
+    installed = list_local_sdk_targets(local_sdk)
+    matching = [
+        target
+        for target in installed
+        if local_target_matches_release(target, release)
+    ]
+    if requested_targets:
+        by_name = {target.target: target for target in installed}
+        builds: list[LocalSdkBuild] = []
+        for requested in requested_targets:
+            target = by_name.get(canonical_local_target_name(requested))
+            if target is None:
+                return None
+            if release != LIVE_RELEASE and not local_target_matches_release(target, release):
+                return None
+            builds.append(LocalSdkBuild(target.arch, target.target))
+        return builds
+    if not matching:
+        return None
+
+    by_arch = {target.arch: target for target in matching}
+    by_target = {target.target: target for target in matching}
+
+    if build_all:
+        return [LocalSdkBuild(target.arch, target.target) for target in matching]
+
+    requested = requested_arches[:]
+    if not requested:
+        last_arch = parse_last_arch(project_dir)
+        if last_arch:
+            requested = [last_arch]
+
+    if not requested:
+        return None
+
+    builds: list[LocalSdkBuild] = []
+    for arch in requested:
+        target = by_target.get(arch) or by_arch.get(arch)
+        if target is None:
+            return None
+        builds.append(LocalSdkBuild(target.arch, target.target))
+    return builds
+
+
+def build_local_sdk_arch(
+    project_dir: Path,
+    local_sdk: Path,
+    release: str,
+    arch: str,
+    target: str,
+    debug_build: bool = False,
+    local_rpm_dirs: list[Path] | None = None,
+    no_vcs_apply: bool = True,
+    allow_untrusted_rpms: bool = False,
+) -> None:
+    user = host_user()
+    uid = os.getuid()
+    gid = os.getgid()
+    home = str(Path.home().resolve())
+    image = local_sdk_build_engine_image(user)
+    project_mount_root = local_sdk_project_mount_root(project_dir)
+    sdk_mount_root = local_sdk_mount_root(local_sdk)
+    binary_names = ":".join(sorted(spec_names(project_dir) | pro_targets(project_dir)))
+    local_rpm_dirs = local_rpm_dirs or []
+
+    inner_command = r'''
+set -euo pipefail
+cd "$PROJECT_DIR"
+mkdir -p .mb2
+mkdir -p .mb2/build-sailfishos-skill
+logfile="$BUILD_LOG"
+: > "$logfile"
+{
+  echo "# build-sailfishos-skill"
+  echo "release=${RELEASE:-}"
+  echo "arch=${ARCH:-}"
+  echo "debug=${DEBUG_BUILD:-0}"
+  echo "target=${TARGET:-}"
+  echo
+} >> "$logfile"
+
+if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
+  rpm_files=()
+  OLDIFS="$IFS"
+  IFS=':'
+  for dir in ${LOCAL_RPM_DIRS}; do
+    [ -d "$dir" ] || continue
+    for rpm in "$dir"/*.rpm; do
+      [ -e "$rpm" ] || continue
+      case "$(basename "$rpm")" in
+        *-debuginfo-*|*-debugsource-*|*-tests-*|*-examples-*|*-doc-*|*-ts-devel-*)
+          continue
+          ;;
+      esac
+      rpm_files+=("$rpm")
+    done
+  done
+  IFS="$OLDIFS"
+  if [ "${#rpm_files[@]}" -gt 0 ]; then
+    zypper_args=( --non-interactive install --oldpackage --force-resolution )
+    if [ "${ALLOW_UNTRUSTED_RPMS:-0}" = "1" ]; then
+      zypper_args+=( --allow-unsigned-rpm )
+    fi
+    sb2 -t "$TARGET" -m sdk-install -R zypper "${zypper_args[@]}" \
+      "${rpm_files[@]}" 2>&1 | tee -a "$logfile"
+  fi
+fi
+
+mb2_args=( -t "$TARGET" )
+if [ "${NO_VCS_APPLY:-0}" = "1" ]; then
+  mb2_args+=( --no-vcs-apply )
+fi
+mb2_args+=( build --prepare )
+if [ "${DEBUG_BUILD:-0}" = "1" ]; then
+  mb2_args+=( -d )
+fi
+mb2 "${mb2_args[@]}" 2>&1 | tee -a "$logfile"
+
+rm -rf .mb2/build-sailfishos-skill/rpms
+if [ -d RPMS ]; then
+  mkdir -p .mb2/build-sailfishos-skill/rpms
+  find RPMS -maxdepth 1 -type f -name '*.rpm' -exec cp -f {} .mb2/build-sailfishos-skill/rpms/ \;
+  chmod -R u+rwX .mb2/build-sailfishos-skill/rpms >/dev/null 2>&1 || true
+fi
+
+OLDIFS="$IFS"
+IFS=':'
+for name in ${SYNC_BINARIES:-}; do
+  [ -n "$name" ] || continue
+  [ -e "$name" ] || continue
+  cp -f "$name" .mb2/build-sailfishos-skill/ >/dev/null 2>&1 || true
+done
+IFS="$OLDIFS"
+'''
+    wrapper_command = rf'''
+set -euo pipefail
+if [ ! -x "$LOCAL_SDK" ]; then
+  echo "Installed Sailfish SDK chroot not found or not executable at $LOCAL_SDK" >&2
+  exit 1
+fi
+if getent passwd mersdk >/dev/null 2>&1; then
+  sed -i 's#^mersdk:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:#{user}:x:{uid}:{gid}::{home}:#' /etc/passwd
+elif ! getent passwd {shlex.quote(user)} >/dev/null 2>&1; then
+  printf '%s:x:%s:%s::%s:/bin/bash\n' {shlex.quote(user)} {uid} {gid} {shlex.quote(home)} >> /etc/passwd
+fi
+"$LOCAL_SDK" -u {shlex.quote(user)} env \
+  PROJECT_DIR="$PROJECT_DIR" \
+  RELEASE="$RELEASE" \
+  TARGET="$TARGET" \
+  ARCH="$ARCH" \
+  DEBUG_BUILD="$DEBUG_BUILD" \
+  BUILD_LOG="$BUILD_LOG" \
+  LOCAL_RPM_DIRS="$LOCAL_RPM_DIRS" \
+  NO_VCS_APPLY="$NO_VCS_APPLY" \
+  ALLOW_UNTRUSTED_RPMS="$ALLOW_UNTRUSTED_RPMS" \
+  SYNC_BINARIES="$SYNC_BINARIES" \
+  bash -lc {shlex.quote(inner_command)}
+'''
+    log(f"Building local SDK target {target} for {release} via installed /srv/mer SDK")
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--privileged",
+            "-v",
+            f"{sdk_mount_root}:{sdk_mount_root}",
+            "-v",
+            f"{project_mount_root}:{project_mount_root}",
+            "-w",
+            str(project_dir),
+            "-e",
+            f"PROJECT_DIR={project_dir}",
+            "-e",
+            f"LOCAL_SDK={local_sdk}",
+            "-e",
+            f"RELEASE={release}",
+            "-e",
+            f"TARGET={target}",
+            "-e",
+            f"ARCH={arch}",
+            "-e",
+            f"DEBUG_BUILD={'1' if debug_build else '0'}",
+            "-e",
+            f"BUILD_LOG={build_log_path(project_dir)}",
+            "-e",
+            f"LOCAL_RPM_DIRS={':'.join(str(path) for path in local_rpm_dirs)}",
+            "-e",
+            f"NO_VCS_APPLY={'1' if no_vcs_apply else '0'}",
+            "-e",
+            f"ALLOW_UNTRUSTED_RPMS={'1' if allow_untrusted_rpms else '0'}",
+            "-e",
+            f"SYNC_BINARIES={binary_names}",
+            image,
+            "bash",
+            "-lc",
+            wrapper_command,
+        ]
+    )
+
+
 def build_arch(
     project_dir: Path,
     release: str,
     arch: str,
     debug_build: bool = False,
     local_rpm_dirs: list[Path] | None = None,
+    no_vcs_apply: bool = False,
+    allow_untrusted_rpms: bool = False,
 ) -> None:
     image = f"{CONTAINER_IMAGE}:{release}"
     target = f"SailfishOS-{release}-{arch}"
@@ -729,13 +1370,16 @@ if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
   done
   IFS="$OLDIFS"
   if [ "${#rpm_files[@]}" -gt 0 ]; then
-    zypper --non-interactive install --allow-unsigned-rpm --oldpackage --force-resolution \
-      "${rpm_files[@]}" 2>&1 | tee -a "$logfile"
+    zypper_args=( --non-interactive install --oldpackage --force-resolution )
+    if [ "${ALLOW_UNTRUSTED_RPMS:-0}" = "1" ]; then
+      zypper_args+=( --allow-unsigned-rpm )
+    fi
+    zypper "${zypper_args[@]}" "${rpm_files[@]}" 2>&1 | tee -a "$logfile"
   fi
 fi
 
 mb2_args=( -t "$TARGET" )
-if [ "${IS_GECKO_BUILD:-0}" = "1" ]; then
+if [ "${IS_GECKO_BUILD:-0}" = "1" ] || [ "${NO_VCS_APPLY:-0}" = "1" ]; then
   mb2_args+=( --no-vcs-apply )
 fi
 mb2_args+=( build )
@@ -840,6 +1484,10 @@ PY
                 "-e",
                 f"LOCAL_RPM_DIRS={':'.join(local_rpm_mounts)}",
                 "-e",
+                f"NO_VCS_APPLY={'1' if no_vcs_apply else '0'}",
+                "-e",
+                f"ALLOW_UNTRUSTED_RPMS={'1' if allow_untrusted_rpms else '0'}",
+                "-e",
                 f"IS_GECKO_BUILD={'1' if is_gecko_build else '0'}",
                 image,
                 "bash",
@@ -901,13 +1549,80 @@ def resolve_project_dir(project_dir: Path) -> Path:
     )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a SailfishOS project in place with Docker and mb2")
+def build_preflight_payload(
+    *,
+    project_dir: Path,
+    context: BuildContext,
+    builds: list[LocalSdkBuild | str],
+    artifacts_dir: Path,
+    local_rpms: dict[Path, list[Path]],
+    debug_build: bool,
+    clean: bool,
+    no_vcs_apply: bool,
+    allow_untrusted_rpms: bool,
+    pull_policy: str,
+    image_available: bool | None,
+) -> dict[str, object]:
+    planned_builds = [
+        {
+            "arch": build.arch if isinstance(build, LocalSdkBuild) else build,
+            "target": build.target if isinstance(build, LocalSdkBuild) else f"SailfishOS-{context.release}-{build}",
+        }
+        for build in builds
+    ]
+    permission_strategy = "local-sdk-user"
+    if context.backend == "docker":
+        permission_strategy = "scoped-acl" if shutil.which("setfacl") else "configured-fallback"
+    would_pull = bool(
+        context.backend == "docker"
+        and (pull_policy == "always" or (pull_policy == "missing" and image_available is False))
+    )
+    return {
+        "schema_version": 1,
+        "helper_version": HELPER_VERSION,
+        "project_dir": str(project_dir),
+        "backend": context.backend,
+        "release": context.release,
+        "image": context.image,
+        "image_available": image_available,
+        "local_sdk": context.local_sdk,
+        "builds": planned_builds,
+        "debug": debug_build,
+        "clean": clean,
+        "no_vcs_apply": no_vcs_apply,
+        "artifacts_dir": str(artifacts_dir),
+        "local_rpms": {
+            str(directory): [str(rpm) for rpm in rpms]
+            for directory, rpms in local_rpms.items()
+        },
+        "allow_untrusted_rpms": allow_untrusted_rpms,
+        "pull_policy": pull_policy,
+        "would_pull": would_pull,
+        "permission_strategy": permission_strategy,
+        "mutates_project": False,
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build a SailfishOS project with Docker or an installed SDK")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {HELPER_VERSION}")
     parser.add_argument("--project-dir", default=".", help="Project root containing rpm/*.spec")
     parser.add_argument("--release", help="SailfishOS release, for example 3.4.0.24")
     parser.add_argument("--arch", action="append", default=[], help="Architecture to build, may be repeated")
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help="Exact installed local SDK target to build; may be repeated",
+    )
     parser.add_argument("--all", action="store_true", help="Build every architecture supported by the chosen SDK image")
     parser.add_argument("--list-arches", action="store_true", help="Print supported architectures and exit")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "docker", "local"),
+        default="auto",
+        help="Build backend. Auto uses --local-sdk/--target when supplied, otherwise Docker",
+    )
     parser.add_argument(
         "--permission-fallback",
         choices=("error", "chmod"),
@@ -930,81 +1645,296 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Directory of locally built RPMs to install into the SDK target before building; may be repeated",
     )
-    parser.add_argument("--no-pull", action="store_true", help="Skip docker pull before building")
-    return parser.parse_args()
+    parser.add_argument(
+        "--pull-policy",
+        choices=("always", "missing", "never"),
+        default="always",
+        help="When to pull the release Docker image",
+    )
+    parser.add_argument("--no-pull", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--local-sdk",
+        nargs="?",
+        const=str(DEFAULT_LOCAL_SDK),
+        help=(
+            "Use the installed SDK chroot through a privileged Docker wrapper "
+            f"instead of a release Docker image. Defaults to {DEFAULT_LOCAL_SDK} "
+            "when no path is supplied."
+        ),
+    )
+    vcs_group = parser.add_mutually_exclusive_group()
+    vcs_group.add_argument(
+        "--no-vcs-apply",
+        dest="no_vcs_apply",
+        action="store_true",
+        default=None,
+        help="Tell mb2 not to apply VCS changes before building",
+    )
+    vcs_group.add_argument(
+        "--vcs-apply",
+        dest="no_vcs_apply",
+        action="store_false",
+        help="Allow mb2 to apply VCS changes (local SDK builds default to no VCS apply)",
+    )
+    parser.add_argument(
+        "--allow-untrusted-rpms",
+        action="store_true",
+        help="Allow unsigned RPMs supplied with --local-rpms-dir",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and print the build plan without pulling, cleaning, changing ACLs, or building",
+    )
+    parser.add_argument("--json", action="store_true", help="Print --dry-run output as JSON")
+    args = parser.parse_args(argv)
+    if args.json and not args.dry_run:
+        parser.error("--json requires --dry-run")
+    if args.target and args.backend == "docker":
+        parser.error("--target requires --backend local or auto")
+    if args.local_sdk and args.backend == "docker":
+        parser.error("--local-sdk cannot be combined with --backend docker")
+    return args
 
 
-def main() -> int:
-    args = parse_args()
+def concise_error(error: BaseException) -> str:
+    if isinstance(error, subprocess.CalledProcessError):
+        command = error.cmd if isinstance(error.cmd, list) else [str(error.cmd)]
+        return f"Command exited with status {error.returncode}: {shlex.join(command)[:500]}"
+    return str(error) or error.__class__.__name__
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     require_tool("docker")
 
     requested_project_dir = Path(args.project_dir).resolve()
     project_dir = resolve_project_dir(requested_project_dir)
 
-    release = resolve_release((requested_project_dir, project_dir), args.release)
-    if not args.no_pull:
-        pull_image(release)
+    if args.no_pull:
+        args.pull_policy = "never"
 
-    supported_arches = list_supported_arches(release)
+    local_requested = args.backend == "local" or args.local_sdk is not None or bool(args.target)
+    local_sdk_value = args.local_sdk or (str(DEFAULT_LOCAL_SDK) if local_requested else None)
+    local_sdk_path = Path(local_sdk_value).expanduser().resolve(strict=False) if local_sdk_value else None
+    local_builds: list[LocalSdkBuild] | None = None
+
+    if local_requested and args.backend != "docker":
+        assert local_sdk_path is not None
+        local_release = local_sdk_requested_release(args.release)
+        local_builds = select_local_sdk_builds(
+            local_sdk_path,
+            local_release,
+            args.arch,
+            args.all or args.list_arches,
+            project_dir,
+            args.target,
+        )
+        if local_builds:
+            if local_release == LIVE_RELEASE:
+                installed_by_name = {target.target: target for target in list_local_sdk_targets(local_sdk_path)}
+                selected = installed_by_name.get(local_builds[0].target)
+                release = (selected.release or selected.version_id) if selected else LIVE_RELEASE
+                release = release or LIVE_RELEASE
+            else:
+                release = local_release
+        elif args.backend == "local" or args.target or local_release == LIVE_RELEASE:
+            available = ", ".join(target.target for target in list_local_sdk_targets(local_sdk_path)) or "none"
+            raise SystemExit(
+                f"No matching installed local SDK target for release {local_release}. Available targets: {available}"
+            )
+        else:
+            log(
+                f"No matching local SDK target for release {local_release}; "
+                f"falling back to {CONTAINER_IMAGE}"
+            )
+            release = resolve_release((requested_project_dir, project_dir), args.release)
+    else:
+        release = resolve_release((requested_project_dir, project_dir), args.release)
+        if release == LIVE_RELEASE:
+            raise SystemExit("Release 'live' requires --local-sdk with a matching installed SDK target.")
+
+    use_local_sdk = local_sdk_path is not None and local_builds is not None
+
+    image: str | None = None
+    image_available: bool | None = None
+    if use_local_sdk:
+        image = local_sdk_build_engine_image(host_user())
+        image_available = docker_image_exists(image)
+        if not image_available and not args.dry_run:
+            raise SystemExit(f"Local SDK wrapper image is not available: {image}")
+    else:
+        image = f"{CONTAINER_IMAGE}:{release}"
+        image_available = docker_image_exists(image)
+
+    supported_arches: list[str] = []
+    if not use_local_sdk and not args.dry_run:
+        image, _ = ensure_image(release, args.pull_policy)
+        image_available = True
+        supported_arches = list_supported_arches(release)
+    elif not use_local_sdk and image_available:
+        supported_arches = list_supported_arches(release)
 
     if args.list_arches:
+        if use_local_sdk:
+            print("\n".join(build.arch for build in local_builds))
+            return 0
+        if args.dry_run and not supported_arches:
+            raise SystemExit(f"Cannot list architectures because Docker image {image} is not available locally.")
         print("\n".join(supported_arches))
         return 0
 
-    arches = resolve_arches(args.arch, args.all, supported_arches, project_dir)
+    if use_local_sdk:
+        builds: list[LocalSdkBuild | str] = local_builds
+    elif args.dry_run and not supported_arches:
+        if args.all:
+            builds = ["<all-supported-architectures>"]
+        else:
+            requested = args.arch or ([parse_last_arch(project_dir)] if parse_last_arch(project_dir) else [])
+            if not requested:
+                raise SystemExit("Pass --arch or make the Docker image available so targets can be discovered.")
+            builds = [arch for arch in requested if arch]
+    else:
+        builds = resolve_arches(args.arch, args.all, supported_arches, project_dir)
     artifacts_dir = Path(args.artifacts_dir).resolve() if args.artifacts_dir else default_artifacts_dir(project_dir)
     local_rpm_dirs = [Path(path).resolve() for path in args.local_rpms_dir]
+    selected_local_rpms = validate_local_rpm_dirs(local_rpm_dirs)
+    no_vcs_apply = args.no_vcs_apply if args.no_vcs_apply is not None else use_local_sdk
 
-    ensure_container_write_access(project_dir, args.permission_fallback)
+    context = BuildContext(
+        backend="local" if use_local_sdk else "docker",
+        release=release,
+        image=image,
+        image_id=docker_image_id(image) if image_available and image else None,
+        local_sdk=str(local_sdk_path) if use_local_sdk else None,
+    )
+    if args.dry_run:
+        payload = build_preflight_payload(
+            project_dir=project_dir,
+            context=context,
+            builds=builds,
+            artifacts_dir=artifacts_dir,
+            local_rpms=selected_local_rpms,
+            debug_build=args.debug,
+            clean=args.clean,
+            no_vcs_apply=no_vcs_apply,
+            allow_untrusted_rpms=args.allow_untrusted_rpms,
+            pull_policy=args.pull_policy,
+            image_available=image_available,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(f"Backend: {payload['backend']}")
+            print(f"Release: {payload['release']}")
+            print(f"Builds: {', '.join(item['target'] for item in payload['builds'])}")
+            print(f"Artifacts: {payload['artifacts_dir']}")
+            print(f"Would pull image: {'yes' if payload['would_pull'] else 'no'}")
+        return 0
 
+    started_at = datetime.now(timezone.utc)
     all_copied_rpms: list[Path] = []
-    for arch in arches:
-        previous_arch = parse_last_arch(project_dir)
-        if previous_arch and previous_arch != arch:
-            cleanup_in_place_artifacts(project_dir, previous_arch, arch)
-        elif args.clean:
-            cleanup_generated_artifacts(project_dir, "Explicit cleanup requested")
+    build_records: list[dict[str, object]] = []
+    rpm_context = stage_local_sdk_rpms(project_dir, selected_local_rpms) if use_local_sdk else nullcontext(local_rpm_dirs)
+    with project_build_lock(project_dir), rpm_context as effective_local_rpm_dirs:
+        if not use_local_sdk:
+            ensure_container_write_access(project_dir, args.permission_fallback)
 
-        try:
-            build_arch(
-                project_dir,
-                release,
-                arch,
-                debug_build=args.debug,
-                local_rpm_dirs=local_rpm_dirs,
-            )
-            write_target_marker(project_dir, arch)
-
-            manifest_paths = generated_candidate_paths(project_dir)
-            write_manifest(project_dir, manifest_paths)
-
-            copied = copy_rpms(project_dir, release, arch, args.debug, artifacts_dir)
-            verify_expected_rpms(copied, args.debug)
+        for build in builds:
+            arch = build.arch if isinstance(build, LocalSdkBuild) else build
+            target = build.target if isinstance(build, LocalSdkBuild) else f"SailfishOS-{release}-{arch}"
+            record: dict[str, object] = {
+                "arch": arch,
+                "target": target,
+                "status": "running",
+                "rpms": [],
+            }
+            build_records.append(record)
             write_build_metadata(
                 project_dir,
-                release=release,
-                arch=arch,
+                context=context,
+                builds=build_records,
                 debug_build=args.debug,
                 artifacts_dir=artifacts_dir,
-                status="success",
-                rpms=copied,
+                status="running",
+                started_at=started_at,
             )
-            all_copied_rpms.extend(copied)
-            log(
-                f"Copied {len(copied)} RPM(s) for {arch} to "
-                f"{variant_destination_dir(artifacts_dir, release, arch, args.debug)}"
-            )
-        except Exception:
-            write_build_metadata(
-                project_dir,
-                release=release,
-                arch=arch,
-                debug_build=args.debug,
-                artifacts_dir=artifacts_dir,
-                status="failed",
-                rpms=[],
-            )
-            raise
+            build_started = time.monotonic()
+            try:
+                previous_arch = parse_last_arch(project_dir)
+                if previous_arch and previous_arch != arch:
+                    cleanup_in_place_artifacts(project_dir, previous_arch, arch)
+                elif args.clean:
+                    cleanup_generated_artifacts(project_dir, "Explicit cleanup requested")
+
+                if isinstance(build, LocalSdkBuild):
+                    assert local_sdk_path is not None
+                    build_local_sdk_arch(
+                        project_dir,
+                        local_sdk_path,
+                        release,
+                        arch,
+                        build.target,
+                        debug_build=args.debug,
+                        local_rpm_dirs=effective_local_rpm_dirs,
+                        no_vcs_apply=no_vcs_apply,
+                        allow_untrusted_rpms=args.allow_untrusted_rpms,
+                    )
+                else:
+                    build_arch(
+                        project_dir,
+                        release,
+                        arch,
+                        debug_build=args.debug,
+                        local_rpm_dirs=effective_local_rpm_dirs,
+                        no_vcs_apply=no_vcs_apply,
+                        allow_untrusted_rpms=args.allow_untrusted_rpms,
+                    )
+                write_target_marker(project_dir, arch)
+                write_manifest(project_dir, generated_candidate_paths(project_dir))
+                copied = copy_rpms(project_dir, release, arch, args.debug, artifacts_dir)
+                verify_expected_rpms(copied, args.debug)
+                record.update(
+                    status="success",
+                    duration_seconds=round(time.monotonic() - build_started, 3),
+                    rpms=copied,
+                )
+                all_copied_rpms.extend(copied)
+                log(
+                    f"Copied {len(copied)} RPM(s) for {arch} to "
+                    f"{variant_destination_dir(artifacts_dir, release, arch, args.debug)}"
+                )
+            except BaseException as error:
+                failure_class = classify_failure(error, build_log_path(project_dir))
+                message = concise_error(error)
+                record.update(
+                    status="failed",
+                    duration_seconds=round(time.monotonic() - build_started, 3),
+                    failure_class=failure_class,
+                    failure_message=message,
+                )
+                write_build_metadata(
+                    project_dir,
+                    context=context,
+                    builds=build_records,
+                    debug_build=args.debug,
+                    artifacts_dir=artifacts_dir,
+                    status="failed",
+                    started_at=started_at,
+                    failure_class=failure_class,
+                    failure_message=message,
+                )
+                raise
+
+        write_build_metadata(
+            project_dir,
+            context=context,
+            builds=build_records,
+            debug_build=args.debug,
+            artifacts_dir=artifacts_dir,
+            status="success",
+            started_at=started_at,
+        )
 
     print("Built RPMs:")
     for rpm in all_copied_rpms:
@@ -1013,4 +1943,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except subprocess.CalledProcessError as error:
+        log(f"Build failed: {concise_error(error)}")
+        sys.exit(error.returncode or 1)
+    except OSError as error:
+        log(f"Build failed: {concise_error(error)}")
+        sys.exit(1)
