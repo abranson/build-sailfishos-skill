@@ -24,6 +24,17 @@ or `mb2` commands. Replace `<skill-dir>` below with this skill's directory.
 5. Report RPMs from `RPMS/<release>/<arch>/<release|debug>/` or the explicit
    `--artifacts-dir`.
 
+## Execution and output
+
+- When the Sailfish Devel MCP is available, prefer its asynchronous build tool.
+  Monitor with bounded `wait_seconds` calls and `lines=0`; request log lines
+  only after failure or when the user needs live progress.
+- For direct helper builds, pass `--quiet`. Successful builds then print only
+  their RPM paths. Failed commands print a bounded tail while the complete
+  build output remains in `.mb2/build-sailfishos-skill-last.log`.
+- Use `.mb2/build-sailfishos-skill-last-build.json` for status, artifacts, and
+  classified failures instead of feeding the full build log back to the model.
+
 ## Backend selection
 
 - Use `--backend docker` for tags available in the third-party Docker mirror.
@@ -53,21 +64,21 @@ the recorded architecture:
 
 ```bash
 python3 <skill-dir>/scripts/build_sailfishos.py \
-  --project-dir . --release <confirmed-image-tag> --backend docker
+  --project-dir . --release <confirmed-image-tag> --backend docker --quiet
 ```
 
 Build an exact installed target:
 
 ```bash
 python3 <skill-dir>/scripts/build_sailfishos.py \
-  --project-dir . --backend local --target aarch64 --no-vcs-apply
+  --project-dir . --backend local --target aarch64 --no-vcs-apply --quiet
 ```
 
 Build all image architectures with debug packages:
 
 ```bash
 python3 <skill-dir>/scripts/build_sailfishos.py \
-  --project-dir . --backend local --release 5.2.0 --all --debug
+  --project-dir . --backend local --release 5.2.0 --all --debug --quiet
 ```
 
 Inject local dependency RPMs:
@@ -75,7 +86,7 @@ Inject local dependency RPMs:
 ```bash
 python3 <skill-dir>/scripts/build_sailfishos.py \
   --project-dir . --backend local --target aarch64 \
-  --local-rpms-dir /path/to/RPMS --allow-untrusted-rpms
+  --local-rpms-dir /path/to/RPMS --allow-untrusted-rpms --quiet
 ```
 
 Only pass `--allow-untrusted-rpms` when unsigned local packages are expected.

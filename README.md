@@ -19,6 +19,7 @@ The helper script can:
 - perform a Docker shadow build with `mb2`
 - document how to use an installed `/srv/mer` devel SDK target, including the privileged Docker wrapper used when direct host `sudo` is unavailable
 - archive RPMs under `RPMS/<release>/<arch>/<release|debug>/`
+- keep direct builds quiet while retaining the complete project build log
 - generate debug packages when `--debug` is used
 - save build logs and machine-readable build metadata under `.mb2/`
 

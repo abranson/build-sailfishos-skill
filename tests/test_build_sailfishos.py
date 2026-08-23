@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -35,6 +37,7 @@ class BuildSailfishOsTests(unittest.TestCase):
                 "--allow-untrusted-rpms",
                 "--dry-run",
                 "--json",
+                "--quiet",
             ]
         )
 
@@ -43,6 +46,51 @@ class BuildSailfishOsTests(unittest.TestCase):
         self.assertEqual(args.pull_policy, "missing")
         self.assertTrue(args.no_vcs_apply)
         self.assertTrue(args.allow_untrusted_rpms)
+        self.assertTrue(args.quiet)
+
+    def test_quiet_run_suppresses_success_output(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        previous = build_sailfishos._QUIET_OUTPUT
+        build_sailfishos._QUIET_OUTPUT = True
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = build_sailfishos.run(
+                    [sys.executable, "-c", "print('large successful output')"]
+                )
+        finally:
+            build_sailfishos._QUIET_OUTPUT = previous
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_quiet_run_reports_bounded_failure_tail(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        previous = build_sailfishos._QUIET_OUTPUT
+        build_sailfishos._QUIET_OUTPUT = True
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    build_sailfishos.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import sys; "
+                                "print('noise' * 20000); "
+                                "print('final useful error'); "
+                                "sys.exit(7)"
+                            ),
+                        ]
+                    )
+        finally:
+            build_sailfishos._QUIET_OUTPUT = previous
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("final useful error", stderr.getvalue())
+        self.assertLess(len(stderr.getvalue()), 7000)
 
     def test_local_sdk_rpms_are_staged_inside_project(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:

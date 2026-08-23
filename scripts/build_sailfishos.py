@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.0.0"
+HELPER_VERSION = "2.1.0"
 LIVE_RELEASE = "live"
 DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
 LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
@@ -35,6 +36,10 @@ BUILD_METADATA_NAME = "build-sailfishos-skill-last-build.json"
 BUILD_LOCK_NAME = "build-sailfishos-skill.lock"
 LOCAL_RPMS_STAGING_NAME = "local-rpms"
 DEFAULT_PERMISSION_FALLBACK = "error"
+QUIET_FAILURE_TAIL_BYTES = 65536
+QUIET_FAILURE_TAIL_LINES = 80
+QUIET_FAILURE_TAIL_CHARS = 6000
+_QUIET_OUTPUT = False
 
 LOCAL_RPM_EXCLUDED_MARKERS = (
     "-debuginfo-",
@@ -117,11 +122,35 @@ class BuildContext:
     local_sdk: str | None
 
 
-def log(message: str) -> None:
-    print(message, file=sys.stderr)
+def log(message: str, *, force: bool = False) -> None:
+    if force or not _QUIET_OUTPUT:
+        print(message, file=sys.stderr)
 
 
 def run(cmd: list[str], cwd: Path | None = None, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+    if _QUIET_OUTPUT and not capture_output:
+        with tempfile.TemporaryFile() as output:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(cwd) if cwd else None,
+                check=False,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            )
+            if completed.returncode:
+                output.seek(0, os.SEEK_END)
+                size = output.tell()
+                output.seek(max(0, size - QUIET_FAILURE_TAIL_BYTES))
+                tail = output.read().decode("utf-8", errors="replace")
+                lines = tail.splitlines()[-QUIET_FAILURE_TAIL_LINES:]
+                excerpt = "\n".join(lines)
+                if len(excerpt) > QUIET_FAILURE_TAIL_CHARS:
+                    excerpt = excerpt[-QUIET_FAILURE_TAIL_CHARS:]
+                    excerpt = "[failure output truncated]\n" + excerpt
+                if excerpt:
+                    print(excerpt, file=sys.stderr)
+                raise subprocess.CalledProcessError(completed.returncode, cmd)
+            return completed
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -1687,6 +1716,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Validate inputs and print the build plan without pulling, cleaning, changing ACLs, or building",
     )
     parser.add_argument("--json", action="store_true", help="Print --dry-run output as JSON")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress successful command output; keep the full project build log and "
+            "print only a bounded tail when a command fails"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.json and not args.dry_run:
         parser.error("--json requires --dry-run")
@@ -1705,7 +1742,9 @@ def concise_error(error: BaseException) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _QUIET_OUTPUT
     args = parse_args(argv)
+    _QUIET_OUTPUT = args.quiet
     require_tool("docker")
 
     requested_project_dir = Path(args.project_dir).resolve()
@@ -1946,8 +1985,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except subprocess.CalledProcessError as error:
-        log(f"Build failed: {concise_error(error)}")
+        log(f"Build failed: {concise_error(error)}", force=True)
         sys.exit(error.returncode or 1)
     except OSError as error:
-        log(f"Build failed: {concise_error(error)}")
+        log(f"Build failed: {concise_error(error)}", force=True)
         sys.exit(1)
