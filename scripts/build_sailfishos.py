@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager, nullcontext
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.1.0"
+HELPER_VERSION = "2.4.0"
 LIVE_RELEASE = "live"
 DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
 LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
@@ -96,6 +97,8 @@ ROOT_DIRS = (
 )
 
 LOCAL_TARGET_ARCHES = ("aarch64", "armv7hl", "i486")
+SNAPSHOT_KEY_MAX_LENGTH = 48
+SNAPSHOT_REPOSITORY_ALIAS_PREFIX = "build-sailfishos"
 
 
 @dataclass(frozen=True)
@@ -105,12 +108,21 @@ class LocalSdkTarget:
     release: str
     version_id: str
     flavour: str
+    snapshot_of: str = ""
+    registered: bool = True
 
 
 @dataclass(frozen=True)
 class LocalSdkBuild:
     arch: str
     target: str
+    snapshot: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotRepository:
+    alias: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -379,6 +391,10 @@ def parse_last_arch(project_dir: Path) -> str | None:
         if arch.endswith(".default"):
             arch = arch[: -len(".default")]
         return arch
+
+    for arch in LOCAL_TARGET_ARCHES:
+        if target == arch or target.startswith(f"{arch}.") or target.startswith(f"{arch}-"):
+            return arch
 
     prefix = target.split(".", 1)[0].strip()
     return prefix or None
@@ -895,44 +911,35 @@ def extract_zypper_names(output: str) -> list[str]:
     return sorted(dict.fromkeys(names))
 
 
-def diagnose_missing_dependencies(project_dir: Path, release: str, arch: str) -> None:
+def diagnose_missing_dependencies(
+    project_dir: Path, release: str, arch: str, *,
+    local_sdk: Path | None = None, target: str | None = None,
+) -> list[dict[str, object]]:
     log_file = build_log_path(project_dir)
     if not log_file.is_file():
-        return
-
-    missing = parse_missing_build_requires(log_file.read_text(encoding="utf-8"))
-    if not missing:
-        return
-
-    image = f"{CONTAINER_IMAGE}:{release}"
-    target = f"SailfishOS-{release}-{arch}"
-    log("Dependency diagnostics from the target SDK:")
-    for requirement in missing:
-        if requirement.startswith("pkgconfig("):
-            query = (
-                f"sb2 -t {shlex.quote(target)} -m sdk-install -R "
-                f"zypper search --provides --match-exact {shlex.quote(requirement)}"
-            )
-        else:
-            query = (
-                f"sb2 -t {shlex.quote(target)} -m sdk-install -R "
-                f"zypper se -s {shlex.quote(requirement)}"
-            )
-
+        return []
+    with log_file.open("rb") as handle:
+        handle.seek(max(0, log_file.stat().st_size - 256 * 1024))
+        missing = parse_missing_build_requires(handle.read().decode("utf-8", errors="replace"))
+    diagnostics = []
+    for requirement in missing[:20]:
+        selected_target = target or f"SailfishOS-{release}-{arch}"
+        query = ["sb2", "-t", selected_target, "-m", "sdk-install", "-R",
+                 "zypper", "search", "--provides", "--match-exact", requirement]
+        command = (local_sdk_command(local_sdk, query) if local_sdk else
+                   ["docker", "run", "--rm", f"{CONTAINER_IMAGE}:{release}",
+                    "bash", "-lc", shlex.join(query)])
+        item: dict[str, object] = {"requirement": requirement, "target": selected_target}
         try:
-            result = run(
-                ["docker", "run", "--rm", image, "bash", "-lc", query],
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError:
-            log(f"- {requirement}: diagnostic lookup failed")
-            continue
-
-        names = extract_zypper_names(result.stdout)
-        if names:
-            log(f"- {requirement}: available as {', '.join(names)}")
-        else:
-            log(f"- {requirement}: not available in {target}")
+            result = subprocess.run(command, text=True, capture_output=True, timeout=15, check=False)
+            item.update(providers=extract_zypper_names(result.stdout)[:20], returncode=result.returncode)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            item["error"] = str(error)[:500]
+        diagnostics.append(item)
+    if diagnostics:
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\nDependency diagnostics: " + json.dumps(diagnostics) + "\n")
+    return diagnostics
 
 
 def verify_expected_rpms(rpms: list[Path], debug_build: bool) -> None:
@@ -981,8 +988,171 @@ def local_sdk_mount_root(local_sdk: Path) -> Path:
     return srv_mer
 
 
+def local_sdk_command(local_sdk: Path, command: list[str]) -> list[str]:
+    user = host_user()
+    uid = os.getuid()
+    gid = os.getgid()
+    home = str(Path.home().resolve())
+    image = local_sdk_build_engine_image(user)
+    sdk_mount_root = local_sdk_mount_root(local_sdk)
+    inner = shlex.join(command)
+    wrapper_command = f"""
+set -euo pipefail
+if [ ! -x "$LOCAL_SDK" ]; then
+    echo "Installed Sailfish SDK chroot not found or not executable at $LOCAL_SDK" >&2
+    exit 1
+fi
+if getent passwd mersdk >/dev/null 2>&1; then
+    sed -i 's#^mersdk:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:#{user}:x:{uid}:{gid}::{home}:#' /etc/passwd
+elif ! getent passwd {shlex.quote(user)} >/dev/null 2>&1; then
+    printf '%s:x:%s:%s::%s:/bin/bash\\n' {shlex.quote(user)} {uid} {gid} {shlex.quote(home)} >> /etc/passwd
+fi
+"$LOCAL_SDK" -u {shlex.quote(user)} {inner}
+""".strip()
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--privileged",
+        "-v",
+        f"{sdk_mount_root}:{sdk_mount_root}",
+        "-e",
+        f"LOCAL_SDK={local_sdk}",
+        image,
+        "bash",
+        "-lc",
+        wrapper_command,
+    ]
+
+
+def sdk_refresh_command(local_sdk: Path, target: str, force: bool = False) -> list[str]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target):
+        raise ValueError("invalid SDK target name")
+    working_target = canonical_local_target_name(target) + ".default"
+    command = ["sb2", "-t", working_target, "-m", "sdk-install", "-R", "zypper", "ref"]
+    if force:
+        command.append("-f")
+    return local_sdk_command(local_sdk, command)
+
+
+def doctor(local_sdk: Path | None = None) -> dict[str, object]:
+    return {
+        "helper_version": HELPER_VERSION,
+        "tools": {name: bool(shutil.which(name)) for name in ("docker", "git", "setfacl", "ssh", "scp", "osc", "rg")},
+        "local_sdk": str(local_sdk) if local_sdk else None,
+        "sdk_executable": bool(local_sdk and os.access(local_sdk, os.X_OK)),
+        "targets": [
+            {"name": target.target, "arch": target.arch, "release": target.release,
+             "registered": target.registered, "snapshot_of": target.snapshot_of}
+            for target in list_local_sdk_targets(local_sdk)
+        ] if local_sdk else [],
+    }
+
+
 def local_sdk_targets_dir(local_sdk: Path) -> Path:
     return local_sdk_mount_root(local_sdk) / "targets"
+
+
+def normalize_snapshot_key(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    if not key:
+        raise SystemExit("Snapshot key must contain at least one letter or digit")
+    if len(key) > SNAPSHOT_KEY_MAX_LENGTH:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+        key = f"{key[: SNAPSHOT_KEY_MAX_LENGTH - len(digest) - 1].rstrip('-')}-{digest}"
+    return key
+
+
+def git_branch_name(project_dir: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_dir), "branch", "--show-current"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return None
+    branch = completed.stdout.strip()
+    return branch or None
+
+
+def git_common_project_name(project_dir: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--git-common-dir"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return None
+    if completed.returncode:
+        return None
+    common_dir = Path(completed.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = (project_dir / common_dir).resolve()
+    if not common_dir.name:
+        return None
+    return common_dir.parent.name if common_dir.name == ".git" else common_dir.name
+
+
+def infer_snapshot_key(project_dir: Path) -> str:
+    candidates = [part for part in reversed(project_dir.resolve().parts) if part]
+    candidates.extend(sorted(spec_names(project_dir)))
+    branch = git_branch_name(project_dir)
+    if branch:
+        candidates.append(branch)
+
+    esr_pattern = re.compile(r"(?:^|[^a-z0-9])esr[-_.]?(\d{2,3})(?=$|[^0-9])", re.IGNORECASE)
+    for candidate in candidates:
+        match = esr_pattern.search(candidate)
+        if match:
+            return f"browser-esr{match.group(1)}"
+
+    names = sorted(spec_names(project_dir))
+    if len(names) == 1:
+        return normalize_snapshot_key(names[0])
+
+    common_name = git_common_project_name(project_dir)
+    return normalize_snapshot_key(common_name or project_dir.name)
+
+
+def local_snapshot_names(base_target: str, snapshot_key: str) -> tuple[str, str]:
+    base_target = canonical_local_target_name(base_target)
+    key = normalize_snapshot_key(snapshot_key)
+    root = key if key.startswith(f"{base_target}-") else f"{base_target}-{key}"
+    return root, f"{root}.default"
+
+
+def parse_snapshot_repositories(values: list[str]) -> list[SnapshotRepository]:
+    repositories: list[SnapshotRepository] = []
+    for value in values:
+        if not value or any(character in value for character in "\0\n\r\t"):
+            raise SystemExit("Snapshot repository must be a non-empty ALIAS=URL or URL value")
+        alias = ""
+        url = value
+        if "=" in value:
+            possible_alias, possible_url = value.split("=", 1)
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", possible_alias) and possible_url:
+                alias = possible_alias
+                url = possible_url
+        if not alias:
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+            alias = f"{SNAPSHOT_REPOSITORY_ALIAS_PREFIX}-{digest}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", alias):
+            raise SystemExit(f"Invalid snapshot repository alias: {alias}")
+        repositories.append(SnapshotRepository(alias=alias, url=url))
+    return repositories
+
+
+def validate_snapshot_packages(values: list[str]) -> list[str]:
+    packages: list[str] = []
+    for value in values:
+        if not value or any(character in value for character in "\0\n\r\t"):
+            raise SystemExit("Snapshot package names must be non-empty single-line values")
+        packages.append(value)
+    return packages
 
 
 def canonical_local_target_name(name: str) -> str:
@@ -1016,13 +1186,16 @@ def read_key_value_file(path: Path) -> dict[str, str]:
     return metadata
 
 
-def target_metadata(target_dir: Path) -> dict[str, str]:
+def target_metadata(target_dir: Path) -> dict[str, str | bool]:
     sailfish = read_key_value_file(target_dir / "etc" / "sailfish-release")
     ssu = read_key_value_file(target_dir / "etc" / "ssu" / "ssu.ini")
+    sdk_manage = read_key_value_file(target_dir / ".sdk-manage.conf")
     return {
         "release": ssu.get("release", ""),
         "version_id": sailfish.get("VERSION_ID", ""),
         "flavour": ssu.get("flavour") or sailfish.get("SAILFISH_FLAVOUR", ""),
+        "snapshot_of": sdk_manage.get("snapshot-of", ""),
+        "registered": ssu.get("registered", "").lower() == "true",
     }
 
 
@@ -1046,9 +1219,9 @@ def list_local_sdk_targets(local_sdk: Path) -> list[LocalSdkTarget]:
             continue
 
         metadata = target_metadata(child)
-        release = metadata.get("release", "")
-        version_id = metadata.get("version_id", "")
-        flavour = metadata.get("flavour", "")
+        release = str(metadata.get("release", ""))
+        version_id = str(metadata.get("version_id", ""))
+        flavour = str(metadata.get("flavour", ""))
         if not release and suffix:
             release = suffix
         targets[target] = LocalSdkTarget(
@@ -1057,6 +1230,8 @@ def list_local_sdk_targets(local_sdk: Path) -> list[LocalSdkTarget]:
             release=release,
             version_id=version_id,
             flavour=flavour,
+            snapshot_of=str(metadata.get("snapshot_of", "")),
+            registered=bool(metadata.get("registered", False)),
         )
     return sorted(targets.values(), key=lambda item: (item.arch, item.target))
 
@@ -1133,13 +1308,18 @@ def select_local_sdk_builds(
 ) -> list[LocalSdkBuild] | None:
     requested_targets = requested_targets or []
     installed = list_local_sdk_targets(local_sdk)
-    matching = [
+    base_targets = [
         target
         for target in installed
+        if not target.snapshot_of and target.registered
+    ]
+    matching = [
+        target
+        for target in base_targets
         if local_target_matches_release(target, release)
     ]
     if requested_targets:
-        by_name = {target.target: target for target in installed}
+        by_name = {target.target: target for target in base_targets}
         builds: list[LocalSdkBuild] = []
         for requested in requested_targets:
             target = by_name.get(canonical_local_target_name(requested))
@@ -1176,14 +1356,40 @@ def select_local_sdk_builds(
     return builds
 
 
+def plan_local_sdk_snapshots(
+    builds: list[LocalSdkBuild],
+    project_dir: Path,
+    requested_key: str | None,
+    *,
+    has_custom_inputs: bool,
+) -> tuple[str | None, list[LocalSdkBuild]]:
+    snapshot_key = None
+    if requested_key:
+        snapshot_key = normalize_snapshot_key(requested_key)
+    elif has_custom_inputs:
+        snapshot_key = infer_snapshot_key(project_dir)
+
+    planned = []
+    for build in builds:
+        if snapshot_key is None:
+            build_target = canonical_local_target_name(build.target)
+        else:
+            build_target, _ = local_snapshot_names(build.target, snapshot_key)
+        planned.append(LocalSdkBuild(build.arch, build.target, build_target))
+    return snapshot_key, planned
+
+
 def build_local_sdk_arch(
     project_dir: Path,
     local_sdk: Path,
     release: str,
     arch: str,
+    base_target: str,
     target: str,
     debug_build: bool = False,
     local_rpm_dirs: list[Path] | None = None,
+    snapshot_repositories: list[SnapshotRepository] | None = None,
+    snapshot_packages: list[str] | None = None,
     no_vcs_apply: bool = True,
     allow_untrusted_rpms: bool = False,
 ) -> None:
@@ -1196,6 +1402,18 @@ def build_local_sdk_arch(
     sdk_mount_root = local_sdk_mount_root(local_sdk)
     binary_names = ":".join(sorted(spec_names(project_dir) | pro_targets(project_dir)))
     local_rpm_dirs = local_rpm_dirs or []
+    snapshot_repositories = snapshot_repositories or []
+    snapshot_packages = snapshot_packages or []
+    base_target = canonical_local_target_name(base_target)
+    target = canonical_local_target_name(target)
+    if target != base_target and not target.startswith(f"{base_target}-"):
+        raise SystemExit(
+            f"Managed snapshot {target!r} does not belong to base target {base_target!r}"
+        )
+    repository_recipe = "\n".join(
+        f"{repository.alias}\t{repository.url}" for repository in snapshot_repositories
+    )
+    package_recipe = "\n".join(snapshot_packages)
 
     inner_command = r'''
 set -euo pipefail
@@ -1209,9 +1427,41 @@ logfile="$BUILD_LOG"
   echo "release=${RELEASE:-}"
   echo "arch=${ARCH:-}"
   echo "debug=${DEBUG_BUILD:-0}"
+  echo "base_target=${BASE_TARGET:-}"
   echo "target=${TARGET:-}"
   echo
 } >> "$logfile"
+
+# The registered architecture target is an immutable base.  Custom inputs use
+# an isolated original target that is reset after the base changes.  mb2 itself
+# creates and manages the mutable .default working snapshot of whichever
+# original target it receives.
+if [ "$TARGET" != "$BASE_TARGET" ]; then
+  sdk-manage target snapshot --reset=outdated --no-sync \
+    "$BASE_TARGET" "$TARGET" 2>&1 | tee -a "$logfile"
+fi
+
+if [ -n "${SNAPSHOT_REPOSITORIES:-}" ]; then
+  while IFS=$'\t' read -r repository_alias repository_url; do
+    [ -n "$repository_alias" ] || continue
+    sb2 -t "$TARGET" -m sdk-install -R zypper --non-interactive \
+      removerepo "$repository_alias" >> "$logfile" 2>&1 || true
+    sb2 -t "$TARGET" -m sdk-install -R zypper --non-interactive \
+      addrepo --refresh "$repository_url" "$repository_alias" 2>&1 | tee -a "$logfile"
+  done <<< "$SNAPSHOT_REPOSITORIES"
+fi
+
+if [ -n "${SNAPSHOT_PACKAGES:-}" ]; then
+  snapshot_packages=()
+  while IFS= read -r package_name; do
+    [ -n "$package_name" ] || continue
+    snapshot_packages+=("$package_name")
+  done <<< "$SNAPSHOT_PACKAGES"
+  if [ "${#snapshot_packages[@]}" -gt 0 ]; then
+    sb2 -t "$TARGET" -m sdk-install -R zypper --non-interactive \
+      install "${snapshot_packages[@]}" 2>&1 | tee -a "$logfile"
+  fi
+fi
 
 if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
   rpm_files=()
@@ -1280,17 +1530,24 @@ fi
 "$LOCAL_SDK" -u {shlex.quote(user)} env \
   PROJECT_DIR="$PROJECT_DIR" \
   RELEASE="$RELEASE" \
+  BASE_TARGET="$BASE_TARGET" \
+  SNAPSHOT_ROOT="$SNAPSHOT_ROOT" \
   TARGET="$TARGET" \
   ARCH="$ARCH" \
   DEBUG_BUILD="$DEBUG_BUILD" \
   BUILD_LOG="$BUILD_LOG" \
   LOCAL_RPM_DIRS="$LOCAL_RPM_DIRS" \
+  SNAPSHOT_REPOSITORIES="$SNAPSHOT_REPOSITORIES" \
+  SNAPSHOT_PACKAGES="$SNAPSHOT_PACKAGES" \
   NO_VCS_APPLY="$NO_VCS_APPLY" \
   ALLOW_UNTRUSTED_RPMS="$ALLOW_UNTRUSTED_RPMS" \
   SYNC_BINARIES="$SYNC_BINARIES" \
   bash -lc {shlex.quote(inner_command)}
 '''
-    log(f"Building local SDK target {target} for {release} via installed /srv/mer SDK")
+    log(
+        f"Building local SDK target {target} from {base_target} "
+        f"for {release} via installed /srv/mer SDK"
+    )
     run(
         [
             "docker",
@@ -1310,6 +1567,8 @@ fi
             "-e",
             f"RELEASE={release}",
             "-e",
+            f"BASE_TARGET={base_target}",
+            "-e",
             f"TARGET={target}",
             "-e",
             f"ARCH={arch}",
@@ -1319,6 +1578,10 @@ fi
             f"BUILD_LOG={build_log_path(project_dir)}",
             "-e",
             f"LOCAL_RPM_DIRS={':'.join(str(path) for path in local_rpm_dirs)}",
+            "-e",
+            f"SNAPSHOT_REPOSITORIES={repository_recipe}",
+            "-e",
+            f"SNAPSHOT_PACKAGES={package_recipe}",
             "-e",
             f"NO_VCS_APPLY={'1' if no_vcs_apply else '0'}",
             "-e",
@@ -1526,7 +1789,6 @@ PY
         )
         run(docker_cmd)
     except subprocess.CalledProcessError:
-        diagnose_missing_dependencies(project_dir, release, arch)
         raise
 
 
@@ -1585,6 +1847,9 @@ def build_preflight_payload(
     builds: list[LocalSdkBuild | str],
     artifacts_dir: Path,
     local_rpms: dict[Path, list[Path]],
+    snapshot_key: str | None,
+    snapshot_repositories: list[SnapshotRepository],
+    snapshot_packages: list[str],
     debug_build: bool,
     clean: bool,
     no_vcs_apply: bool,
@@ -1595,7 +1860,16 @@ def build_preflight_payload(
     planned_builds = [
         {
             "arch": build.arch if isinstance(build, LocalSdkBuild) else build,
-            "target": build.target if isinstance(build, LocalSdkBuild) else f"SailfishOS-{context.release}-{build}",
+            "target": (
+                build.snapshot or build.target
+                if isinstance(build, LocalSdkBuild)
+                else f"SailfishOS-{context.release}-{build}"
+            ),
+            **(
+                {"base_target": build.target}
+                if isinstance(build, LocalSdkBuild)
+                else {}
+            ),
         }
         for build in builds
     ]
@@ -1624,6 +1898,12 @@ def build_preflight_payload(
             str(directory): [str(rpm) for rpm in rpms]
             for directory, rpms in local_rpms.items()
         },
+        "snapshot_key": snapshot_key,
+        "snapshot_repositories": [
+            {"alias": repository.alias, "url": repository.url}
+            for repository in snapshot_repositories
+        ],
+        "snapshot_packages": snapshot_packages,
         "allow_untrusted_rpms": allow_untrusted_rpms,
         "pull_policy": pull_policy,
         "would_pull": would_pull,
@@ -1634,6 +1914,9 @@ def build_preflight_payload(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a SailfishOS project with Docker or an installed SDK")
+    parser.add_argument("--doctor", action="store_true", help="Report local tools and SDK targets as JSON without building")
+    parser.add_argument("--refresh-metadata", action="store_true", help="Refresh one installed SDK working target, without building")
+    parser.add_argument("--force-refresh", action="store_true", help="Force metadata refresh with zypper ref -f")
     parser.add_argument("--version", action="version", version=f"%(prog)s {HELPER_VERSION}")
     parser.add_argument("--project-dir", default=".", help="Project root containing rpm/*.spec")
     parser.add_argument("--release", help="SailfishOS release, for example 3.4.0.24")
@@ -1642,7 +1925,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target",
         action="append",
         default=[],
-        help="Exact installed local SDK target to build; may be repeated",
+        help="Exact registered local SDK base target; builds use a managed project snapshot",
+    )
+    parser.add_argument(
+        "--snapshot-key",
+        help=(
+            "Stable isolation key for a managed local SDK snapshot. Ordinary "
+            "builds share the base target's .default snapshot; custom inputs "
+            "default to an ESR-aware key or the package/repository name"
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-repository",
+        action="append",
+        default=[],
+        metavar="[ALIAS=]URL",
+        help="Repository to ensure in the managed project snapshot; may be repeated",
+    )
+    parser.add_argument(
+        "--snapshot-package",
+        action="append",
+        default=[],
+        help="Package to ensure in the managed project snapshot; may be repeated",
     )
     parser.add_argument("--all", action="store_true", help="Build every architecture supported by the chosen SDK image")
     parser.add_argument("--list-arches", action="store_true", help="Print supported architectures and exit")
@@ -1729,6 +2033,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--json requires --dry-run")
     if args.target and args.backend == "docker":
         parser.error("--target requires --backend local or auto")
+    if (
+        args.snapshot_key or args.snapshot_repository or args.snapshot_package
+    ) and args.backend == "docker":
+        parser.error("snapshot options require --backend local or auto")
     if args.local_sdk and args.backend == "docker":
         parser.error("--local-sdk cannot be combined with --backend docker")
     return args
@@ -1745,6 +2053,17 @@ def main(argv: list[str] | None = None) -> int:
     global _QUIET_OUTPUT
     args = parse_args(argv)
     _QUIET_OUTPUT = args.quiet
+    if args.doctor:
+        print(json.dumps(doctor(Path(args.local_sdk or DEFAULT_LOCAL_SDK)), sort_keys=True))
+        return 0
+    if args.refresh_metadata:
+        if len(args.target) != 1 or args.backend == "docker" or args.dry_run:
+            raise SystemExit("--refresh-metadata requires one --target and a local backend; cannot use --dry-run")
+        sdk = Path(args.local_sdk or DEFAULT_LOCAL_SDK).expanduser().resolve()
+        run(sdk_refresh_command(sdk, args.target[0], args.force_refresh))
+        return 0
+    if args.force_refresh:
+        raise SystemExit("--force-refresh requires --refresh-metadata")
     require_tool("docker")
 
     requested_project_dir = Path(args.project_dir).resolve()
@@ -1753,7 +2072,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_pull:
         args.pull_policy = "never"
 
-    local_requested = args.backend == "local" or args.local_sdk is not None or bool(args.target)
+    local_requested = (
+        args.backend == "local"
+        or args.local_sdk is not None
+        or bool(args.target)
+        or bool(args.snapshot_key)
+        or bool(args.snapshot_repository)
+        or bool(args.snapshot_package)
+    )
     local_sdk_value = args.local_sdk or (str(DEFAULT_LOCAL_SDK) if local_requested else None)
     local_sdk_path = Path(local_sdk_value).expanduser().resolve(strict=False) if local_sdk_value else None
     local_builds: list[LocalSdkBuild] | None = None
@@ -1778,9 +2104,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 release = local_release
         elif args.backend == "local" or args.target or local_release == LIVE_RELEASE:
-            available = ", ".join(target.target for target in list_local_sdk_targets(local_sdk_path)) or "none"
+            available = ", ".join(
+                target.target
+                for target in list_local_sdk_targets(local_sdk_path)
+                if not target.snapshot_of and target.registered
+            ) or "none"
             raise SystemExit(
-                f"No matching installed local SDK target for release {local_release}. Available targets: {available}"
+                f"No matching registered local SDK base target for release {local_release}. "
+                f"Available base targets: {available}"
             )
         else:
             log(
@@ -1823,6 +2154,22 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(supported_arches))
         return 0
 
+    snapshot_repositories = parse_snapshot_repositories(args.snapshot_repository)
+    snapshot_packages = validate_snapshot_packages(args.snapshot_package)
+    local_rpm_dirs = [Path(path).resolve() for path in args.local_rpms_dir]
+    selected_local_rpms = validate_local_rpm_dirs(local_rpm_dirs)
+    snapshot_key: str | None = None
+    if use_local_sdk:
+        assert local_builds is not None
+        snapshot_key, local_builds = plan_local_sdk_snapshots(
+            local_builds,
+            project_dir,
+            args.snapshot_key,
+            has_custom_inputs=bool(
+                snapshot_repositories or snapshot_packages or selected_local_rpms
+            ),
+        )
+
     if use_local_sdk:
         builds: list[LocalSdkBuild | str] = local_builds
     elif args.dry_run and not supported_arches:
@@ -1836,8 +2183,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         builds = resolve_arches(args.arch, args.all, supported_arches, project_dir)
     artifacts_dir = Path(args.artifacts_dir).resolve() if args.artifacts_dir else default_artifacts_dir(project_dir)
-    local_rpm_dirs = [Path(path).resolve() for path in args.local_rpms_dir]
-    selected_local_rpms = validate_local_rpm_dirs(local_rpm_dirs)
     no_vcs_apply = args.no_vcs_apply if args.no_vcs_apply is not None else use_local_sdk
 
     context = BuildContext(
@@ -1854,6 +2199,9 @@ def main(argv: list[str] | None = None) -> int:
             builds=builds,
             artifacts_dir=artifacts_dir,
             local_rpms=selected_local_rpms,
+            snapshot_key=snapshot_key,
+            snapshot_repositories=snapshot_repositories,
+            snapshot_packages=snapshot_packages,
             debug_build=args.debug,
             clean=args.clean,
             no_vcs_apply=no_vcs_apply,
@@ -1881,13 +2229,20 @@ def main(argv: list[str] | None = None) -> int:
 
         for build in builds:
             arch = build.arch if isinstance(build, LocalSdkBuild) else build
-            target = build.target if isinstance(build, LocalSdkBuild) else f"SailfishOS-{release}-{arch}"
+            target = (
+                build.snapshot or build.target
+                if isinstance(build, LocalSdkBuild)
+                else f"SailfishOS-{release}-{arch}"
+            )
             record: dict[str, object] = {
                 "arch": arch,
                 "target": target,
                 "status": "running",
                 "rpms": [],
             }
+            if isinstance(build, LocalSdkBuild):
+                record["base_target"] = build.target
+                record["snapshot_key"] = snapshot_key
             build_records.append(record)
             write_build_metadata(
                 project_dir,
@@ -1908,14 +2263,18 @@ def main(argv: list[str] | None = None) -> int:
 
                 if isinstance(build, LocalSdkBuild):
                     assert local_sdk_path is not None
+                    assert build.snapshot is not None
                     build_local_sdk_arch(
                         project_dir,
                         local_sdk_path,
                         release,
                         arch,
                         build.target,
+                        build.snapshot,
                         debug_build=args.debug,
                         local_rpm_dirs=effective_local_rpm_dirs,
+                        snapshot_repositories=snapshot_repositories,
+                        snapshot_packages=snapshot_packages,
                         no_vcs_apply=no_vcs_apply,
                         allow_untrusted_rpms=args.allow_untrusted_rpms,
                     )
@@ -1945,6 +2304,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except BaseException as error:
                 failure_class = classify_failure(error, build_log_path(project_dir))
+                try:
+                    record["dependency_diagnostics"] = diagnose_missing_dependencies(
+                        project_dir, release, arch,
+                        local_sdk=local_sdk_path if isinstance(build, LocalSdkBuild) else None,
+                        target=(canonical_local_target_name(build.snapshot or build.target) + ".default")
+                        if isinstance(build, LocalSdkBuild) else None,
+                    )
+                except Exception as diagnostic_error:
+                    record["dependency_diagnostics"] = [{"error": str(diagnostic_error)[:500]}]
                 message = concise_error(error)
                 record.update(
                     status="failed",
@@ -1975,7 +2343,8 @@ def main(argv: list[str] | None = None) -> int:
             started_at=started_at,
         )
 
-    print("Built RPMs:")
+    if not args.quiet:
+        print("Built RPMs:")
     for rpm in all_copied_rpms:
         print(rpm)
     return 0

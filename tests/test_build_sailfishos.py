@@ -35,6 +35,12 @@ class BuildSailfishOsTests(unittest.TestCase):
                 "missing",
                 "--no-vcs-apply",
                 "--allow-untrusted-rpms",
+                "--snapshot-key",
+                "browser-esr153",
+                "--snapshot-repository",
+                "browser=https://example.invalid/browser",
+                "--snapshot-package",
+                "qtmozembed-qt5-devel",
                 "--dry-run",
                 "--json",
                 "--quiet",
@@ -46,7 +52,116 @@ class BuildSailfishOsTests(unittest.TestCase):
         self.assertEqual(args.pull_policy, "missing")
         self.assertTrue(args.no_vcs_apply)
         self.assertTrue(args.allow_untrusted_rpms)
+        self.assertEqual(args.snapshot_key, "browser-esr153")
+        self.assertEqual(
+            args.snapshot_repository,
+            ["browser=https://example.invalid/browser"],
+        )
+        self.assertEqual(args.snapshot_package, ["qtmozembed-qt5-devel"])
         self.assertTrue(args.quiet)
+
+    def test_snapshot_key_groups_work_by_esr_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            esr_140 = self.make_project(root / ".codex-webview-esr140-worktree")
+            esr_153 = self.make_project(root / ".codex-gecko-esr153-worktree")
+
+            self.assertEqual(build_sailfishos.infer_snapshot_key(esr_140), "browser-esr140")
+            self.assertEqual(build_sailfishos.infer_snapshot_key(esr_153), "browser-esr153")
+
+    def test_snapshot_key_falls_back_to_stable_package_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+
+            self.assertEqual(build_sailfishos.infer_snapshot_key(project), "example")
+
+    def test_snapshot_plan_reuses_one_named_environment(self):
+        builds = [build_sailfishos.LocalSdkBuild("aarch64", "aarch64")]
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            key, planned = build_sailfishos.plan_local_sdk_snapshots(
+                builds,
+                project,
+                "browser-esr153",
+                has_custom_inputs=False,
+            )
+
+        self.assertEqual(key, "browser-esr153")
+        self.assertEqual(
+            planned,
+            [
+                build_sailfishos.LocalSdkBuild(
+                    "aarch64",
+                    "aarch64",
+                    "aarch64-browser-esr153",
+                )
+            ],
+        )
+
+    def test_snapshot_plan_shares_base_default_without_custom_inputs(self):
+        builds = [build_sailfishos.LocalSdkBuild("aarch64", "aarch64")]
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            key, planned = build_sailfishos.plan_local_sdk_snapshots(
+                builds,
+                project,
+                None,
+                has_custom_inputs=False,
+            )
+
+        self.assertIsNone(key)
+        self.assertEqual(
+            planned,
+            [
+                build_sailfishos.LocalSdkBuild(
+                    "aarch64",
+                    "aarch64",
+                    "aarch64",
+                )
+            ],
+        )
+
+    def test_snapshot_plan_isolates_implicit_custom_inputs(self):
+        builds = [build_sailfishos.LocalSdkBuild("aarch64", "aarch64")]
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            key, planned = build_sailfishos.plan_local_sdk_snapshots(
+                builds,
+                project,
+                None,
+                has_custom_inputs=True,
+            )
+
+        self.assertEqual(key, "example")
+        self.assertEqual(planned[0].snapshot, "aarch64-example")
+
+    def test_snapshot_target_marker_still_resolves_architecture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            (project / ".mb2").mkdir()
+            (project / ".mb2" / "target").write_text(
+                "aarch64-browser-esr153.default\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(build_sailfishos.parse_last_arch(project), "aarch64")
+
+    def test_snapshot_repository_recipe_has_stable_alias(self):
+        repositories = build_sailfishos.parse_snapshot_repositories(
+            [
+                "browser=https://example.invalid/browser",
+                "https://example.invalid/extra",
+                "https://example.invalid/private?token=opaque",
+            ]
+        )
+
+        self.assertEqual(repositories[0].alias, "browser")
+        self.assertEqual(repositories[0].url, "https://example.invalid/browser")
+        self.assertTrue(repositories[1].alias.startswith("build-sailfishos-"))
+        self.assertEqual(
+            repositories[2].url,
+            "https://example.invalid/private?token=opaque",
+        )
 
     def test_quiet_run_suppresses_success_output(self):
         stdout = io.StringIO()
@@ -140,6 +255,143 @@ class BuildSailfishOsTests(unittest.TestCase):
 
         self.assertEqual(selected, [build_sailfishos.LocalSdkBuild("aarch64", "aarch64-devel")])
 
+    def test_local_target_selection_ignores_project_snapshots(self):
+        base = build_sailfishos.LocalSdkTarget(
+            arch="aarch64",
+            target="aarch64",
+            release="live",
+            version_id="5.3.0.10",
+            flavour="devel",
+        )
+        snapshot = build_sailfishos.LocalSdkTarget(
+            arch="aarch64",
+            target="aarch64-browser-esr153",
+            release="live",
+            version_id="5.3.0.10",
+            flavour="devel",
+            snapshot_of="aarch64",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            with mock.patch.object(
+                build_sailfishos,
+                "list_local_sdk_targets",
+                return_value=[snapshot, base],
+            ):
+                selected = build_sailfishos.select_local_sdk_builds(
+                    Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
+                    "live",
+                    ["aarch64"],
+                    False,
+                    project,
+                )
+
+        self.assertEqual(selected, [build_sailfishos.LocalSdkBuild("aarch64", "aarch64")])
+
+    def test_local_target_selection_requires_registered_base(self):
+        target = build_sailfishos.LocalSdkTarget(
+            arch="aarch64",
+            target="aarch64",
+            release="live",
+            version_id="5.3.0.10",
+            flavour="devel",
+            registered=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            with mock.patch.object(
+                build_sailfishos,
+                "list_local_sdk_targets",
+                return_value=[target],
+            ):
+                selected = build_sailfishos.select_local_sdk_builds(
+                    Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
+                    "live",
+                    ["aarch64"],
+                    False,
+                    project,
+                )
+
+        self.assertIsNone(selected)
+
+    def test_local_build_prepares_and_uses_snapshot_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            with (
+                mock.patch.object(build_sailfishos, "host_user", return_value="builder"),
+                mock.patch.object(
+                    build_sailfishos,
+                    "local_sdk_project_mount_root",
+                    return_value=Path("/workspace"),
+                ),
+                mock.patch.object(
+                    build_sailfishos,
+                    "local_sdk_mount_root",
+                    return_value=Path("/srv/mer"),
+                ),
+                mock.patch.object(build_sailfishos, "run") as run,
+            ):
+                build_sailfishos.build_local_sdk_arch(
+                    project,
+                    Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
+                    "5.3.0.10",
+                    "aarch64",
+                    "aarch64",
+                    "aarch64-browser-esr153",
+                    snapshot_repositories=[
+                        build_sailfishos.SnapshotRepository(
+                            "browser",
+                            "https://example.invalid/browser",
+                        )
+                    ],
+                    snapshot_packages=["qtmozembed-qt5-devel"],
+                )
+
+        command = run.call_args.args[0]
+        command_text = " ".join(command)
+        self.assertIn("BASE_TARGET=aarch64", command)
+        self.assertIn("TARGET=aarch64-browser-esr153", command)
+        self.assertIn("SNAPSHOT_REPOSITORIES=browser\thttps://example.invalid/browser", command)
+        self.assertIn("SNAPSHOT_PACKAGES=qtmozembed-qt5-devel", command)
+        self.assertIn("sdk-manage target snapshot --reset=outdated", command_text)
+        self.assertIn('if [ "$TARGET" != "$BASE_TARGET" ]; then', command_text)
+        self.assertIn('mb2_args=( -t "$TARGET" )', command_text)
+        self.assertNotIn("SNAPSHOT_ROOT=", command)
+        self.assertNotIn('sb2 -t "$BASE_TARGET"', command_text)
+
+    def test_local_build_normalizes_nested_default_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            with (
+                mock.patch.object(build_sailfishos, "host_user", return_value="builder"),
+                mock.patch.object(
+                    build_sailfishos,
+                    "local_sdk_project_mount_root",
+                    return_value=Path("/workspace"),
+                ),
+                mock.patch.object(
+                    build_sailfishos,
+                    "local_sdk_mount_root",
+                    return_value=Path("/srv/mer"),
+                ),
+                mock.patch.object(build_sailfishos, "run") as run,
+            ):
+                build_sailfishos.build_local_sdk_arch(
+                    project,
+                    Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
+                    "5.3.0.10",
+                    "aarch64",
+                    "aarch64.default",
+                    "aarch64-example.default.default",
+                )
+
+        command = run.call_args.args[0]
+        self.assertIn("BASE_TARGET=aarch64", command)
+        self.assertIn("TARGET=aarch64-example", command)
+        self.assertNotIn("SNAPSHOT_ROOT=", command)
+        self.assertNotIn("TARGET=aarch64-example.default", command)
+        self.assertNotIn("TARGET=aarch64-example.default.default", command)
+
     def test_dry_run_does_not_mutate_project_or_pull(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.make_project(Path(temporary))
@@ -170,6 +422,98 @@ class BuildSailfishOsTests(unittest.TestCase):
             self.assertFalse(payload["mutates_project"])
             ensure_image.assert_not_called()
             self.assertFalse((project / ".mb2").exists())
+
+    def test_local_dry_run_reports_base_and_managed_snapshot(self):
+        target = build_sailfishos.LocalSdkTarget(
+            arch="aarch64",
+            target="aarch64",
+            release="live",
+            version_id="5.3.0.10",
+            flavour="devel",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(build_sailfishos, "require_tool"),
+                mock.patch.object(
+                    build_sailfishos,
+                    "list_local_sdk_targets",
+                    return_value=[target],
+                ),
+                mock.patch.object(build_sailfishos, "docker_image_exists", return_value=True),
+                mock.patch.object(build_sailfishos, "docker_image_id", return_value="image-id"),
+                redirect_stdout(stdout),
+            ):
+                result = build_sailfishos.main(
+                    [
+                        "--project-dir",
+                        str(project),
+                        "--backend",
+                        "local",
+                        "--arch",
+                        "aarch64",
+                        "--snapshot-key",
+                        "browser-esr153",
+                        "--snapshot-repository",
+                        "browser=https://example.invalid/browser",
+                        "--snapshot-package",
+                        "qtmozembed-qt5-devel",
+                        "--dry-run",
+                        "--json",
+                    ]
+                )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(payload["builds"][0]["base_target"], "aarch64")
+        self.assertEqual(
+            payload["builds"][0]["target"],
+            "aarch64-browser-esr153",
+        )
+        self.assertEqual(payload["snapshot_key"], "browser-esr153")
+        self.assertEqual(payload["snapshot_packages"], ["qtmozembed-qt5-devel"])
+
+    def test_local_dry_run_uses_shared_default_without_custom_inputs(self):
+        target = build_sailfishos.LocalSdkTarget(
+            arch="aarch64",
+            target="aarch64",
+            release="live",
+            version_id="5.3.0.10",
+            flavour="devel",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.make_project(Path(temporary))
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(build_sailfishos, "require_tool"),
+                mock.patch.object(
+                    build_sailfishos,
+                    "list_local_sdk_targets",
+                    return_value=[target],
+                ),
+                mock.patch.object(build_sailfishos, "docker_image_exists", return_value=True),
+                mock.patch.object(build_sailfishos, "docker_image_id", return_value="image-id"),
+                redirect_stdout(stdout),
+            ):
+                result = build_sailfishos.main(
+                    [
+                        "--project-dir",
+                        str(project),
+                        "--backend",
+                        "local",
+                        "--arch",
+                        "aarch64",
+                        "--dry-run",
+                        "--json",
+                    ]
+                )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(payload["builds"][0]["base_target"], "aarch64")
+        self.assertEqual(payload["builds"][0]["target"], "aarch64")
+        self.assertIsNone(payload["snapshot_key"])
 
     def test_registry_fallback_is_not_labeled_current_release(self):
         stderr = io.StringIO()
