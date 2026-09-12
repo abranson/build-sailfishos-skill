@@ -50,9 +50,10 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(helper.main(['--refresh-metadata','--target','aarch64-project.default',
                                           '--force-refresh','--quiet']),0)
         command=run.call_args.args[0]
-        self.assertIn(f'install -d -m 0755 -o {helper.os.getuid()} -g {helper.os.getgid()} {Path.home().resolve()}',command[-1])
         home=str(Path.home().resolve())
-        self.assertIn(f'{home}/.scratchbox2:{home}/.scratchbox2',command)
+        sdk_home='/srv/mer/sdks/sfossdk' + home
+        self.assertIn(f'{home}/.scratchbox2:{sdk_home}/.scratchbox2',command)
+        self.assertIn('-m root sb2 -t aarch64-project.default',command[-1])
         self.assertIn('sb2 -t aarch64-project.default',command[-1])
         self.assertIn('zypper ref -f',command[-1]);self.assertNotIn('.default.default',command[-1])
 

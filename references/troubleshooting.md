@@ -39,3 +39,11 @@ python3 <skill-dir>/scripts/build_sailfishos.py --refresh-metadata \
 
 This uses the same SDK wrapper as MCP. It does not create a missing target;
 preflight/build the project first. Use `--force-refresh` only when necessary.
+
+If SDK refresh reports `Invalid target specified`, verify that the user's
+`~/.scratchbox2` registry is visible inside the SDK. Administrative wrappers mount
+only that directory directly at `<sdkroot><home>/.scratchbox2` and use
+`sdk-chroot -m root`; the default home bind would hide the nested mount. Do not
+expose the whole host home as a workaround. `sb2 -m sdk-install -R` remains
+required independently. Container user and primary-group mappings must both exist
+before sdk-chroot imports them into the SDK.

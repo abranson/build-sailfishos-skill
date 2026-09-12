@@ -26,7 +26,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.4.1"
+HELPER_VERSION = "2.4.2"
 LIVE_RELEASE = "live"
 DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
 LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
@@ -995,6 +995,9 @@ def local_sdk_command(local_sdk: Path, command: list[str]) -> list[str]:
     home = str(Path.home().resolve())
     image = local_sdk_build_engine_image(user)
     sdk_mount_root = local_sdk_mount_root(local_sdk)
+    # sdk-chroot's default non-recursive home bind hides an outer ~/.scratchbox2
+    # mount. Mount only the registry at its final chroot path and skip that bind.
+    sdk_home = local_sdk.resolve(strict=False).parent / Path(home).relative_to("/")
     inner = shlex.join(command)
     wrapper_command = f"""
 set -euo pipefail
@@ -1007,8 +1010,11 @@ if getent passwd mersdk >/dev/null 2>&1; then
 elif ! getent passwd {shlex.quote(user)} >/dev/null 2>&1; then
     printf '%s:x:%s:%s::%s:/bin/bash\\n' {shlex.quote(user)} {uid} {gid} {shlex.quote(home)} >> /etc/passwd
 fi
-install -d -m 0755 -o {uid} -g {gid} {shlex.quote(home)}
-"$LOCAL_SDK" -u {shlex.quote(user)} {inner}
+if [ "$(getent group {gid} | cut -d: -f1)" != {shlex.quote(user)} ]; then
+    sed -i -e '/^{user}:/d' -e '/^[^:]*:[^:]*:{gid}:/d' /etc/group
+    printf '%s:x:%s:\\n' {shlex.quote(user)} {gid} >> /etc/group
+fi
+"$LOCAL_SDK" -u {shlex.quote(user)} -m root {inner}
 """.strip()
     return [
         "docker",
@@ -1018,7 +1024,7 @@ install -d -m 0755 -o {uid} -g {gid} {shlex.quote(home)}
         "-v",
         f"{sdk_mount_root}:{sdk_mount_root}",
         "-v",
-        f"{home}/.scratchbox2:{home}/.scratchbox2",
+        f"{home}/.scratchbox2:{sdk_home}/.scratchbox2",
         "-e",
         f"LOCAL_SDK={local_sdk}",
         image,
@@ -1529,6 +1535,10 @@ if getent passwd mersdk >/dev/null 2>&1; then
   sed -i 's#^mersdk:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:#{user}:x:{uid}:{gid}::{home}:#' /etc/passwd
 elif ! getent passwd {shlex.quote(user)} >/dev/null 2>&1; then
   printf '%s:x:%s:%s::%s:/bin/bash\n' {shlex.quote(user)} {uid} {gid} {shlex.quote(home)} >> /etc/passwd
+fi
+if [ "$(getent group {gid} | cut -d: -f1)" != {shlex.quote(user)} ]; then
+    sed -i -e '/^{user}:/d' -e '/^[^:]*:[^:]*:{gid}:/d' /etc/group
+    printf '%s:x:%s:\n' {shlex.quote(user)} {gid} >> /etc/group
 fi
 "$LOCAL_SDK" -u {shlex.quote(user)} env \
   PROJECT_DIR="$PROJECT_DIR" \
