@@ -356,7 +356,7 @@ class BuildSailfishOsTests(unittest.TestCase):
         self.assertIn("sdk-manage target snapshot --reset=outdated", command_text)
         self.assertIn('if [ "$TARGET" != "$BASE_TARGET" ]; then', command_text)
         self.assertIn('mb2_args=( -t "$TARGET" )', command_text)
-        self.assertNotIn("SNAPSHOT_ROOT=", command)
+        self.assertNotIn("SNAPSHOT_ROOT=", command_text)
         self.assertNotIn('sb2 -t "$BASE_TARGET"', command_text)
 
     def test_local_build_normalizes_nested_default_target(self):
@@ -386,9 +386,10 @@ class BuildSailfishOsTests(unittest.TestCase):
                 )
 
         command = run.call_args.args[0]
+        command_text = " ".join(command)
         self.assertIn("BASE_TARGET=aarch64", command)
         self.assertIn("TARGET=aarch64-example", command)
-        self.assertNotIn("SNAPSHOT_ROOT=", command)
+        self.assertNotIn("SNAPSHOT_ROOT=", command_text)
         self.assertNotIn("TARGET=aarch64-example.default", command)
         self.assertNotIn("TARGET=aarch64-example.default.default", command)
 

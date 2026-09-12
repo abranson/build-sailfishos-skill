@@ -26,7 +26,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.4.0"
+HELPER_VERSION = "2.4.1"
 LIVE_RELEASE = "live"
 DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
 LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
@@ -1007,6 +1007,7 @@ if getent passwd mersdk >/dev/null 2>&1; then
 elif ! getent passwd {shlex.quote(user)} >/dev/null 2>&1; then
     printf '%s:x:%s:%s::%s:/bin/bash\\n' {shlex.quote(user)} {uid} {gid} {shlex.quote(home)} >> /etc/passwd
 fi
+install -d -m 0755 -o {uid} -g {gid} {shlex.quote(home)}
 "$LOCAL_SDK" -u {shlex.quote(user)} {inner}
 """.strip()
     return [
@@ -1016,6 +1017,8 @@ fi
         "--privileged",
         "-v",
         f"{sdk_mount_root}:{sdk_mount_root}",
+        "-v",
+        f"{home}/.scratchbox2:{home}/.scratchbox2",
         "-e",
         f"LOCAL_SDK={local_sdk}",
         image,
@@ -1531,7 +1534,6 @@ fi
   PROJECT_DIR="$PROJECT_DIR" \
   RELEASE="$RELEASE" \
   BASE_TARGET="$BASE_TARGET" \
-  SNAPSHOT_ROOT="$SNAPSHOT_ROOT" \
   TARGET="$TARGET" \
   ARCH="$ARCH" \
   DEBUG_BUILD="$DEBUG_BUILD" \
