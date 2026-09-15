@@ -4,7 +4,8 @@
 
 - Use `--backend docker` for tags available in the third-party Docker mirror.
 - Use `--backend local` for an installed SDK. `--local-sdk` without a path uses
-  `/srv/mer/sdks/sfossdk/sdk-chroot`.
+  the first executable SDK found at `/srv/mer/sdks/sfossdk/sdk-chroot` or
+  `/srv/sfos/sdks/sdk/sdk-chroot`. Pass an explicit path for another layout.
 - `--backend auto` uses local mode when `--local-sdk` or `--target` is present;
   otherwise it uses Docker. An explicitly requested local backend never falls
   back silently.
@@ -13,7 +14,9 @@
   that base.
 - For local SDK builds, let the helper use its privileged Docker wrapper. Do
   not launch `sdk-chroot` directly from Codex. The wrapper's passwd/group
-  changes remain ephemeral and the real SDK root is not rewritten.
+  changes remain ephemeral and the real SDK root is not rewritten. The helper
+  mounts the nearest SDK ancestor containing the associated `targets/`
+  directory.
 
 ## Common commands
 

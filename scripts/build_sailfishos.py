@@ -26,9 +26,13 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.4.2"
+HELPER_VERSION = "2.4.3"
 LIVE_RELEASE = "live"
-DEFAULT_LOCAL_SDK = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
+LOCAL_SDK_CANDIDATES = (
+    Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
+    Path("/srv/sfos/sdks/sdk/sdk-chroot"),
+)
+DEFAULT_LOCAL_SDK = LOCAL_SDK_CANDIDATES[0]
 LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV = "SAILFISH_SDK_BUILD_ENGINE_IMAGE"
 STATE_DIRNAME = "build-sailfishos-skill"
 MANIFEST_NAME = "build-sailfishos-skill-manifest.txt"
@@ -965,6 +969,13 @@ def local_sdk_build_engine_image(user: str) -> str:
     return os.environ.get(LOCAL_SDK_BUILD_ENGINE_IMAGE_ENV, f"sailfish-sdk-build-engine:{user}")
 
 
+def default_local_sdk() -> Path:
+    for candidate in LOCAL_SDK_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return DEFAULT_LOCAL_SDK
+
+
 def local_sdk_project_mount_root(project_dir: Path) -> Path:
     home = Path.home().resolve()
     resolved = project_dir.resolve()
@@ -980,12 +991,10 @@ def local_sdk_project_mount_root(project_dir: Path) -> Path:
 
 def local_sdk_mount_root(local_sdk: Path) -> Path:
     resolved = local_sdk.resolve(strict=False)
-    srv_mer = Path("/srv/mer")
-    try:
-        resolved.relative_to(srv_mer)
-    except ValueError:
-        return resolved.parent
-    return srv_mer
+    for parent in resolved.parents:
+        if (parent / "targets").is_dir():
+            return parent
+    return resolved.parent
 
 
 def local_sdk_command(local_sdk: Path, command: list[str]) -> list[str]:
@@ -1558,7 +1567,7 @@ fi
 '''
     log(
         f"Building local SDK target {target} from {base_target} "
-        f"for {release} via installed /srv/mer SDK"
+        f"for {release} via installed SDK {local_sdk}"
     )
     run(
         [
@@ -1925,6 +1934,7 @@ def build_preflight_payload(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    selected_local_sdk = default_local_sdk()
     parser = argparse.ArgumentParser(description="Build a SailfishOS project with Docker or an installed SDK")
     parser.add_argument("--doctor", action="store_true", help="Report local tools and SDK targets as JSON without building")
     parser.add_argument("--refresh-metadata", action="store_true", help="Refresh one installed SDK working target, without building")
@@ -2000,10 +2010,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--local-sdk",
         nargs="?",
-        const=str(DEFAULT_LOCAL_SDK),
+        const=str(selected_local_sdk),
         help=(
             "Use the installed SDK chroot through a privileged Docker wrapper "
-            f"instead of a release Docker image. Defaults to {DEFAULT_LOCAL_SDK} "
+            f"instead of a release Docker image. Defaults to {selected_local_sdk} "
             "when no path is supplied."
         ),
     )
@@ -2066,12 +2076,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     _QUIET_OUTPUT = args.quiet
     if args.doctor:
-        print(json.dumps(doctor(Path(args.local_sdk or DEFAULT_LOCAL_SDK)), sort_keys=True))
+        sdk = Path(args.local_sdk) if args.local_sdk else default_local_sdk()
+        print(json.dumps(doctor(sdk), sort_keys=True))
         return 0
     if args.refresh_metadata:
         if len(args.target) != 1 or args.backend == "docker" or args.dry_run:
             raise SystemExit("--refresh-metadata requires one --target and a local backend; cannot use --dry-run")
-        sdk = Path(args.local_sdk or DEFAULT_LOCAL_SDK).expanduser().resolve()
+        sdk = Path(args.local_sdk) if args.local_sdk else default_local_sdk()
+        sdk = sdk.expanduser().resolve()
         run(sdk_refresh_command(sdk, args.target[0], args.force_refresh))
         return 0
     if args.force_refresh:
@@ -2092,7 +2104,7 @@ def main(argv: list[str] | None = None) -> int:
         or bool(args.snapshot_repository)
         or bool(args.snapshot_package)
     )
-    local_sdk_value = args.local_sdk or (str(DEFAULT_LOCAL_SDK) if local_requested else None)
+    local_sdk_value = args.local_sdk or (str(default_local_sdk()) if local_requested else None)
     local_sdk_path = Path(local_sdk_value).expanduser().resolve(strict=False) if local_sdk_value else None
     local_builds: list[LocalSdkBuild] | None = None
 

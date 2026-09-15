@@ -46,7 +46,8 @@ class DiagnosticTests(unittest.TestCase):
         self.assertFalse(json.loads(output.getvalue())['tools']['docker'])
 
     def test_refresh_cli_selects_working_target_and_force_flag(self):
-        with patch.object(helper,'run') as run:
+        sdk = Path('/srv/mer/sdks/sfossdk/sdk-chroot')
+        with patch.object(helper,'default_local_sdk',return_value=sdk),patch.object(helper,'run') as run:
             self.assertEqual(helper.main(['--refresh-metadata','--target','aarch64-project.default',
                                           '--force-refresh','--quiet']),0)
         command=run.call_args.args[0]

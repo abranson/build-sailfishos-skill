@@ -60,6 +60,39 @@ class BuildSailfishOsTests(unittest.TestCase):
         self.assertEqual(args.snapshot_package, ["qtmozembed-qt5-devel"])
         self.assertTrue(args.quiet)
 
+    def test_default_local_sdk_uses_first_executable_candidate(self):
+        primary = Path("/srv/mer/sdks/sfossdk/sdk-chroot")
+        alternate = Path("/srv/sfos/sdks/sdk/sdk-chroot")
+
+        def is_executable(path, mode):
+            return path == alternate and mode == build_sailfishos.os.X_OK
+
+        with (
+            mock.patch.object(
+                build_sailfishos,
+                "LOCAL_SDK_CANDIDATES",
+                (primary, alternate),
+            ),
+            mock.patch.object(
+                build_sailfishos.os,
+                "access",
+                side_effect=is_executable,
+            ),
+        ):
+            selected = build_sailfishos.default_local_sdk()
+
+        self.assertEqual(selected, alternate)
+
+    def test_local_sdk_mount_root_finds_targets_ancestor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdks" / "sdk" / "sdk-chroot"
+            sdk.parent.mkdir(parents=True)
+            sdk.touch()
+            (root / "targets").mkdir()
+
+            self.assertEqual(build_sailfishos.local_sdk_mount_root(sdk), root)
+
     def test_snapshot_key_groups_work_by_esr_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -17,6 +17,7 @@ The helper script can:
 - discover a SailfishOS build root one level below a repo root
 - clean stale in-place build artifacts when switching architectures
 - perform a Docker shadow build with `mb2`
+- discover installed SDKs in the `/srv/mer` and `/srv/sfos` layouts
 - let `mb2` share its standard `.default` snapshot per installed SDK base for
   ordinary builds, using isolated original targets only for custom
   repositories, packages, local RPMs, or an explicit isolation key
