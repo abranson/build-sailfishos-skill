@@ -86,21 +86,22 @@ the SDK's mounted roots remain visible inside the chroot.
   a stable key from the project, with `esrNNN` work mapping to
   `browser-esrNNN`; use `--snapshot-key` to deliberately share one custom
   input environment across related projects.
-- Isolated environments use an original target named `<base>-<key>`, reset
-  from `<base>` with `sdk-manage target snapshot --reset=outdated`. Custom
-  inputs are applied to that original, then `mb2` creates and manages its
-  `<base>-<key>.default` working snapshot. The helper must pass the original
-  target to `mb2`, never its `.default` child; otherwise `mb2` creates a broken
-  `.default.default` chain.
+- Isolated environments use one snapshot named `<base>-<key>`, reset from
+  `<base>` with `sdk-manage target snapshot --reset=outdated`. Custom inputs
+  are applied to that snapshot, then the helper builds directly in it with
+  `mb2 --no-snapshot=force`. It takes a per-SDK-target lock so worktrees that
+  share a key cannot mutate the snapshot concurrently. Older helper versions
+  created a redundant `<base>-<key>.default` child; remove those children with
+  `sdk-manage` after confirming that no old helper or build is active.
 - A reset intentionally removes snapshot-only repositories and packages. Pass
   persistent inputs on every applicable build with repeatable
   `--snapshot-repository [ALIAS=]URL`, `--snapshot-package`, and
   `--local-rpms-dir` options. The helper reapplies them before `mb2 build
   --prepare`, which restores declared BuildRequires.
 - Retain registered architecture bases and their shared, `mb2`-managed
-  `.default` snapshots. Remove obsolete isolated originals with `sdk-manage`,
-  including their children, after confirming that no build is active. Do not
-  remove target directories directly.
+  `.default` snapshots. Remove obsolete isolated snapshots with `sdk-manage`
+  after confirming that no build is active. Do not remove target directories
+  directly.
 
 Use `--pull-policy always|missing|never` to control Docker image pulls.
 `always` preserves the release-build default. Use `missing` for reproducible
@@ -110,10 +111,10 @@ offline-friendly iteration and `never` when the image must already exist.
 
 - The helper takes a non-blocking project lock. Never launch overlapping
   builds in the same project; a second invocation exits with the lock owner.
-- The standard `.default` snapshot is shared by ordinary projects, and a named
-  snapshot may be shared by projects with the same custom inputs. Rely on
-  `mb2` to coordinate concurrent snapshot modifications; do not add a separate
-  helper-level per-snapshot lock.
+- The standard `.default` snapshot is shared by ordinary projects and remains
+  coordinated by `mb2`. A named snapshot may be shared by projects with the
+  same custom inputs; direct builds use the helper's per-SDK-target lock to
+  serialize its reset, recipe application, and build preparation.
 - Docker builds use an internal shadow copy and sync generated outputs back.
 - Local SDK builds run as the project owner and default to `--no-vcs-apply`.
   Pass `--vcs-apply` only when that behavior is deliberately wanted.

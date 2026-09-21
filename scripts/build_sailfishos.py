@@ -26,7 +26,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.4.3"
+HELPER_VERSION = "2.4.4"
 LIVE_RELEASE = "live"
 LOCAL_SDK_CANDIDATES = (
     Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
@@ -242,6 +242,47 @@ def project_build_lock(project_dir: Path):
         lock_file.seek(0)
         lock_file.truncate()
         lock_file.write(f"pid={os.getpid()} started_utc={datetime.now(timezone.utc).isoformat()}\n")
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def local_sdk_target_lock_path(local_sdk: Path, target: str) -> Path:
+    identity = f"{local_sdk.resolve(strict=False)}\0{canonical_local_target_name(target)}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    root = Path(tempfile.gettempdir()) / f"build-sailfishos-{os.getuid()}"
+    return root / f"sdk-target-{digest}.lock"
+
+
+@contextmanager
+def local_sdk_target_lock(local_sdk: Path, target: str):
+    target = canonical_local_target_name(target)
+    path = local_sdk_target_lock_path(local_sdk, target)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = path.parent.stat()
+    if (
+        path.parent.is_symlink()
+        or directory.st_uid != os.getuid()
+        or directory.st_mode & 0o077
+    ):
+        raise SystemExit(f"Unsafe SDK target lock directory: {path.parent}")
+    with path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            owner = lock_file.read().strip()
+            detail = f" (owner {owner})" if owner else ""
+            raise SystemExit(
+                f"Another SailfishOS build is already using SDK target {target}{detail}."
+            ) from exc
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(
+            f"pid={os.getpid()} started_utc={datetime.now(timezone.utc).isoformat()}\n"
+        )
         lock_file.flush()
         try:
             yield
@@ -1043,10 +1084,18 @@ fi
     ]
 
 
-def sdk_refresh_command(local_sdk: Path, target: str, force: bool = False) -> list[str]:
+def sdk_refresh_target(local_sdk: Path, target: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target):
         raise ValueError("invalid SDK target name")
-    working_target = canonical_local_target_name(target) + ".default"
+    canonical_target = canonical_local_target_name(target)
+    if target.endswith(".default"):
+        return f"{canonical_target}.default"
+    metadata = target_metadata(local_sdk_targets_dir(local_sdk) / canonical_target)
+    return canonical_target if metadata.get("snapshot_of") else f"{canonical_target}.default"
+
+
+def sdk_refresh_command(local_sdk: Path, target: str, force: bool = False) -> list[str]:
+    working_target = sdk_refresh_target(local_sdk, target)
     command = ["sb2", "-t", working_target, "-m", "sdk-install", "-R", "zypper", "ref"]
     if force:
         command.append("-f")
@@ -1177,6 +1226,12 @@ def canonical_local_target_name(name: str) -> str:
     while name.endswith(".default"):
         name = name[: -len(".default")]
     return name
+
+
+def local_sdk_build_target(base_target: str, target: str) -> str:
+    base_target = canonical_local_target_name(base_target)
+    target = canonical_local_target_name(target)
+    return f"{base_target}.default" if target == base_target else target
 
 
 def split_local_target_arch(target: str) -> tuple[str, str] | None:
@@ -1450,10 +1505,9 @@ logfile="$BUILD_LOG"
   echo
 } >> "$logfile"
 
-# The registered architecture target is an immutable base.  Custom inputs use
-# an isolated original target that is reset after the base changes.  mb2 itself
-# creates and manages the mutable .default working snapshot of whichever
-# original target it receives.
+# The registered architecture target is an immutable base. Custom inputs use
+# an isolated snapshot that is reset after the base changes and built directly.
+# Ordinary base builds retain mb2's shared .default working snapshot.
 if [ "$TARGET" != "$BASE_TARGET" ]; then
   sdk-manage target snapshot --reset=outdated --no-sync \
     "$BASE_TARGET" "$TARGET" 2>&1 | tee -a "$logfile"
@@ -1509,6 +1563,9 @@ if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
 fi
 
 mb2_args=( -t "$TARGET" )
+if [ "$TARGET" != "$BASE_TARGET" ]; then
+  mb2_args+=( --no-snapshot=force )
+fi
 if [ "${NO_VCS_APPLY:-0}" = "1" ]; then
   mb2_args+=( --no-vcs-apply )
 fi
@@ -2288,20 +2345,29 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(build, LocalSdkBuild):
                     assert local_sdk_path is not None
                     assert build.snapshot is not None
-                    build_local_sdk_arch(
-                        project_dir,
-                        local_sdk_path,
-                        release,
-                        arch,
-                        build.target,
-                        build.snapshot,
-                        debug_build=args.debug,
-                        local_rpm_dirs=effective_local_rpm_dirs,
-                        snapshot_repositories=snapshot_repositories,
-                        snapshot_packages=snapshot_packages,
-                        no_vcs_apply=no_vcs_apply,
-                        allow_untrusted_rpms=args.allow_untrusted_rpms,
+                    isolated = canonical_local_target_name(
+                        build.snapshot
+                    ) != canonical_local_target_name(build.target)
+                    target_lock = (
+                        local_sdk_target_lock(local_sdk_path, build.snapshot)
+                        if isolated
+                        else nullcontext()
                     )
+                    with target_lock:
+                        build_local_sdk_arch(
+                            project_dir,
+                            local_sdk_path,
+                            release,
+                            arch,
+                            build.target,
+                            build.snapshot,
+                            debug_build=args.debug,
+                            local_rpm_dirs=effective_local_rpm_dirs,
+                            snapshot_repositories=snapshot_repositories,
+                            snapshot_packages=snapshot_packages,
+                            no_vcs_apply=no_vcs_apply,
+                            allow_untrusted_rpms=args.allow_untrusted_rpms,
+                        )
                 else:
                     build_arch(
                         project_dir,
@@ -2332,7 +2398,7 @@ def main(argv: list[str] | None = None) -> int:
                     record["dependency_diagnostics"] = diagnose_missing_dependencies(
                         project_dir, release, arch,
                         local_sdk=local_sdk_path if isinstance(build, LocalSdkBuild) else None,
-                        target=(canonical_local_target_name(build.snapshot or build.target) + ".default")
+                        target=local_sdk_build_target(build.target, build.snapshot or build.target)
                         if isinstance(build, LocalSdkBuild) else None,
                     )
                 except Exception as diagnostic_error:

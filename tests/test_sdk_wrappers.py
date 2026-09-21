@@ -77,8 +77,11 @@ Path('RPMS/example.rpm').write_text('test artifact')
                 command = run.call_args.args[0]
                 result = self.execute_wrapper(command, root)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-                self.assertEqual(json.loads((root / 'trace.json').read_text()),
-                                 ['-t', target, '--no-vcs-apply', 'build', '--prepare'])
+                expected = ['-t', target]
+                if target != 'aarch64':
+                    expected.append('--no-snapshot=force')
+                expected.extend(['--no-vcs-apply', 'build', '--prepare'])
+                self.assertEqual(json.loads((root / 'trace.json').read_text()), expected)
                 self.assertTrue((helper.staging_rpms_dir(project) / 'example.rpm').exists())
                 # Control: the historical unbound expansion must fail this execution test.
                 broken = [*command[:-1], command[-1].replace(

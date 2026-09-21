@@ -266,6 +266,35 @@ class BuildSailfishOsTests(unittest.TestCase):
                     with build_sailfishos.project_build_lock(project):
                         pass
 
+    def test_isolated_sdk_target_lock_rejects_a_second_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdks" / "sfossdk" / "sdk-chroot"
+            with (
+                mock.patch.object(
+                    build_sailfishos.tempfile,
+                    "gettempdir",
+                    return_value=temporary,
+                ),
+                build_sailfishos.local_sdk_target_lock(sdk, "aarch64-browser-esr153"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "SDK target aarch64-browser-esr153"):
+                    with build_sailfishos.local_sdk_target_lock(
+                        sdk,
+                        "aarch64-browser-esr153.default",
+                    ):
+                        pass
+
+    def test_local_sdk_build_target_uses_only_base_default(self):
+        self.assertEqual(
+            build_sailfishos.local_sdk_build_target("aarch64", "aarch64"),
+            "aarch64.default",
+        )
+        self.assertEqual(
+            build_sailfishos.local_sdk_build_target("aarch64", "aarch64-browser-esr153"),
+            "aarch64-browser-esr153",
+        )
+
     def test_exact_local_target_selection(self):
         target = build_sailfishos.LocalSdkTarget(
             arch="aarch64",
@@ -347,7 +376,7 @@ class BuildSailfishOsTests(unittest.TestCase):
 
         self.assertIsNone(selected)
 
-    def test_local_build_prepares_and_uses_snapshot_only(self):
+    def test_local_build_prepares_and_builds_directly_in_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.make_project(Path(temporary))
             with (
@@ -389,6 +418,7 @@ class BuildSailfishOsTests(unittest.TestCase):
         self.assertIn("sdk-manage target snapshot --reset=outdated", command_text)
         self.assertIn('if [ "$TARGET" != "$BASE_TARGET" ]; then', command_text)
         self.assertIn('mb2_args=( -t "$TARGET" )', command_text)
+        self.assertIn('mb2_args+=( --no-snapshot=force )', command_text)
         self.assertNotIn("SNAPSHOT_ROOT=", command_text)
         self.assertNotIn('sb2 -t "$BASE_TARGET"', command_text)
 

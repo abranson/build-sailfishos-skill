@@ -58,6 +58,20 @@ class DiagnosticTests(unittest.TestCase):
         self.assertIn('sb2 -t aarch64-project.default',command[-1])
         self.assertIn('zypper ref -f',command[-1]);self.assertNotIn('.default.default',command[-1])
 
+    def test_refresh_uses_direct_managed_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sdk = root / 'sdks' / 'sfossdk' / 'sdk-chroot'
+            sdk.parent.mkdir(parents=True)
+            sdk.touch()
+            target = sdk.parent / 'targets' / 'aarch64-project'
+            target.mkdir(parents=True)
+            (target / '.sdk-manage.conf').write_text('snapshot-of=aarch64\n')
+            with patch.object(helper,'host_user',return_value='builder'):
+                command = helper.sdk_refresh_command(sdk,'aarch64-project',force=True)
+        self.assertIn('sb2 -t aarch64-project -m sdk-install -R zypper ref -f',command[-1])
+        self.assertNotIn('aarch64-project.default',command[-1])
+
     def test_refresh_rejects_ambiguous_or_docker_target(self):
         for arguments in (['--refresh-metadata'], ['--refresh-metadata','--target','aarch64','--target','armv7hl'],
                           ['--refresh-metadata','--target','aarch64','--dry-run']):

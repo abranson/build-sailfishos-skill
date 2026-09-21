@@ -19,10 +19,11 @@ reconstructing Docker, SDK-chroot or mb2 commands.
    backend must not silently fall back. Docker mirror tags describe available
    images, not the current SailfishOS release. Prefer a confirmed explicit tag.
 4. Keep registered SDK bases pristine. Ordinary helper builds share mb2's
-   `.default`; custom inputs get an isolated original target. **When task or
+   `.default`; custom inputs get an isolated snapshot that the helper builds
+   directly with `--no-snapshot=force`. **When task or
    repository instructions require per-project isolation, supply a stable
    `snapshot_key` / `--snapshot-key` even without custom inputs.** Keep that key
-   on subsequent builds. Never pass a `.default` target to mb2 directly.
+   on subsequent builds. Never pass a `.default` target to the helper.
 5. Start `sailfish_build_rpm`, or invoke the helper with `--quiet`. Use the
    architecture recorded in `.mb2/target` unless another was requested.
 6. Report RPM paths and warnings from the completion metadata. The default
